@@ -530,7 +530,7 @@ struct task_group {
 	/* Latency-sensitive flag used for a task group */
 	unsigned int		latency_sensitive;
 
-	ANDROID_VENDOR_DATA_ARRAY(1, 4);
+	ANDROID_VENDOR_DATA_ARRAY(1, 8);
 #endif
 
 	ANDROID_KABI_RESERVE(1);
