@@ -435,10 +435,21 @@ void blk_crypto_evict_key(struct block_device *bdev,
 	struct request_queue *q = bdev_get_queue(bdev);
 	int err;
 
-	if (blk_crypto_config_supported_natively(bdev, &key->crypto_cfg))
+	if (blk_crypto_config_supported_natively(bdev, &key->crypto_cfg)) {
 		err = __blk_crypto_evict_key(q->crypto_profile, key);
-	else
+	} else {
+		/*
+		 * The blk-crypto fallback only ever supports raw keys, and its
+		 * profile is allocated lazily when the fallback is first used.
+		 * A wrapped key that the device doesn't support natively was
+		 * never programmed anywhere, so there is nothing to evict;
+		 * calling into the fallback here would dereference its
+		 * still-NULL profile.
+		 */
+		if (key->crypto_cfg.key_type != BLK_CRYPTO_KEY_TYPE_RAW)
+			return;
 		err = blk_crypto_fallback_evict_key(key);
+	}
 	/*
 	 * An error can only occur here if the key failed to be evicted from a
 	 * keyslot (due to a hardware or driver issue) or is allegedly still in
