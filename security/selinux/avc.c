@@ -1037,6 +1037,7 @@ int avc_has_extended_perms(u32 ssid, u32 tsid, u16 tclass, u32 requested,
 	struct extended_perms_data dontaudit;
 	struct avc_xperms_node local_xp_node;
 	struct avc_xperms_node *xp_node;
+	u32 legacy_perm;
 	int rc = 0, rc2;
 
 	xp_node = &local_xp_node;
@@ -1051,6 +1052,15 @@ int avc_has_extended_perms(u32 ssid, u32 tsid, u16 tclass, u32 requested,
 	} else {
 		memcpy(&avd, &node->ae.avd, sizeof(avd));
 		xp_node = node->ae.xp_node;
+	}
+	if (base_perm == AVC_EXT_NLMSG &&
+	    tclass == SECCLASS_NETLINK_ROUTE_SOCKET &&
+	    requested == NETLINK_ROUTE_SOCKET__NLMSG &&
+	    !selinux_nlmsg_lookup_route_legacy((u16)driver << 8 | xperm,
+					      &legacy_perm) &&
+	    (avd.allowed & legacy_perm) == legacy_perm) {
+		requested = legacy_perm;
+		goto decision;
 	}
 	/* if extended permissions are not defined, only consider av_decision */
 	if (!xp_node || !xp_node->xp.len)
