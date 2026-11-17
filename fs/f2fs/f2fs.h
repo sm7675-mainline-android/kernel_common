@@ -293,6 +293,16 @@ struct f2fs_mount_info {
 #define F2FS_FEATURE_DEVICE_ALIAS		0x00008000
 #define F2FS_FEATURE_PACKED_SSA			0x00010000
 
+/*
+ * OPLUS/OnePlus vendor features. They live on the superblock of a
+ * filesystem formatted by an OPLUS kernel (its mkfs sets them); mainline
+ * reserves those bits.
+ */
+#define F2FS_FEATURE_SEQZONE			0x20000000
+#define F2FS_FEATURE_DEDUP			0x80000000
+#define F2FS_FEATURE_OPLUS_MASK			(F2FS_FEATURE_SEQZONE | \
+						 F2FS_FEATURE_DEDUP)
+
 #define __F2FS_HAS_FEATURE(raw_super, mask)				\
 	((raw_super->feature & cpu_to_le32(mask)) != 0)
 #define F2FS_HAS_FEATURE(sbi, mask)	__F2FS_HAS_FEATURE(sbi->raw_super, mask)
@@ -3938,6 +3948,39 @@ static inline int get_inline_xattr_addrs(struct inode *inode)
 #define F2FS_TOTAL_EXTRA_ATTR_SIZE			\
 	(offsetof(struct f2fs_inode, i_extra_end) -	\
 	offsetof(struct f2fs_inode, i_extra_isize))	\
+
+/*
+ * Largest inline extra-attribute size accepted on disk. OPLUS stores the
+ * extra words i_inner_ino/i_dedup_flags/i_dedup_rsvd, growing the area
+ * from 36 to 48 bytes; those bytes are only self-describing metadata, so
+ * an inode carrying 48 must be accepted even though mainline never writes
+ * it. When F2FS_OPLUS_INODE_LAYOUT is off the bound stays at 36 and the
+ * kernel behaves exactly like upstream.
+ */
+#ifdef CONFIG_F2FS_OPLUS_INODE_LAYOUT
+#define F2FS_OPLUS_EXTRA_ATTR_SIZE	(F2FS_TOTAL_EXTRA_ATTR_SIZE + \
+					 3 * sizeof(__le32))
+#define F2FS_MAX_EXTRA_ATTR_SIZE	F2FS_OPLUS_EXTRA_ATTR_SIZE
+#else /* !CONFIG_F2FS_OPLUS_INODE_LAYOUT */
+#define F2FS_MAX_EXTRA_ATTR_SIZE	F2FS_TOTAL_EXTRA_ATTR_SIZE
+#endif /* !CONFIG_F2FS_OPLUS_INODE_LAYOUT */
+
+/*
+ * Inline extra-attribute size to stamp into a newly created inode. It is
+ * inherited from the parent directory so the layout already used by the
+ * filesystem is preserved: an OPLUS filesystem keeps writing 48, a
+ * mainline one keeps writing 36, and a single filesystem never ends up
+ * with two different inode layouts.
+ */
+static inline size_t f2fs_new_extra_isize(struct inode *dir)
+{
+	size_t size = F2FS_I(dir)->i_extra_isize;
+
+	if (size > F2FS_MAX_EXTRA_ATTR_SIZE ||
+			size < F2FS_TOTAL_EXTRA_ATTR_SIZE)
+		size = F2FS_TOTAL_EXTRA_ATTR_SIZE;
+	return size;
+}
 
 #define F2FS_OLD_ATTRIBUTE_SIZE	(offsetof(struct f2fs_inode, i_addr))
 #define F2FS_FITS_IN_INODE(f2fs_inode, extra_isize, field)		\

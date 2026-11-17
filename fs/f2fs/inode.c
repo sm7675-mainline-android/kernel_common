@@ -317,12 +317,12 @@ static bool sanity_check_inode(struct inode *inode,
 				  __func__, inode->i_ino);
 			return false;
 		}
-		if (fi->i_extra_isize > F2FS_TOTAL_EXTRA_ATTR_SIZE ||
+		if (fi->i_extra_isize > F2FS_MAX_EXTRA_ATTR_SIZE ||
 			fi->i_extra_isize < F2FS_MIN_EXTRA_ATTR_SIZE ||
 			fi->i_extra_isize % sizeof(__le32)) {
 			f2fs_warn(sbi, "%s: inode (ino=%lx) has corrupted i_extra_isize: %d, max: %zu",
 				  __func__, inode->i_ino, fi->i_extra_isize,
-				  F2FS_TOTAL_EXTRA_ATTR_SIZE);
+				  (size_t)F2FS_MAX_EXTRA_ATTR_SIZE);
 			return false;
 		}
 		if (f2fs_sb_has_compression(sbi) &&
