@@ -32,6 +32,7 @@
 #include <linux/ptrace.h>
 #include <linux/signal.h>
 #include <linux/signalfd.h>
+#include <linux/splashlog.h>
 #include <linux/ratelimit.h>
 #include <linux/task_work.h>
 #include <linux/capability.h>
@@ -3032,6 +3033,7 @@ relock:
 		current->flags |= PF_SIGNALED;
 
 		if (sig_kernel_coredump(signr)) {
+			splashlog_user_fault(&ksig->info, false);
 			if (print_fatal_signals)
 				print_fatal_signal(signr);
 			proc_coredump_connector(current);
@@ -3064,6 +3066,9 @@ relock:
 	spin_unlock_irq(&sighand->siglock);
 
 	ksig->sig = signr;
+	if (signr && sig_kernel_coredump(signr) &&
+	    (ksig->info.si_code > 0 || signr == SIGABRT))
+		splashlog_user_fault(&ksig->info, true);
 
 	if (signr && !(ksig->ka.sa.sa_flags & SA_EXPOSE_TAGBITS))
 		hide_si_addr_tag_bits(ksig);

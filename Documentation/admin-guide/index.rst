@@ -50,6 +50,7 @@ Booting the kernel
 
    bootconfig
    kernel-parameters
+   splashlog
    efi-stub
    initrd
 

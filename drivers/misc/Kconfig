@@ -5,6 +5,19 @@
 
 menu "Misc devices"
 
+config SPLASHLOG
+	bool "Early splash framebuffer console and persistent boot log"
+	depends on ARM64
+	select FONT_SUPPORT
+	select FONT_8x16
+	default n
+	help
+	  Record boot messages in reserved memory and render them in the
+	  bootloader framebuffer until the native display driver takes over.
+	  Runtime activation requires spl.enable; additional diagnostics and
+	  restart watchdogs require explicit boot parameters. See
+	  Documentation/admin-guide/splashlog.rst for memory requirements.
+
 config SENSORS_LIS3LV02D
 	tristate
 	depends on INPUT
