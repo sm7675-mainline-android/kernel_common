@@ -86,6 +86,27 @@ struct llcc_slice_desc {
 	size_t slice_size;
 };
 
+enum llcc_staling_mode {
+	LLCC_STALING_MODE_CAPACITY,
+	LLCC_STALING_MODE_NOTIFY,
+	LLCC_STALING_MODE_MAX
+};
+
+enum llcc_staling_notify_op {
+	LLCC_NOTIFY_STALING_WRITEBACK,
+	LLCC_NOTIFY_STALING_OPS_MAX
+};
+
+struct llcc_staling_mode_params {
+	enum llcc_staling_mode staling_mode;
+	union {
+		struct staling_mode_notify_params {
+			u8 staling_distance;
+			enum llcc_staling_notify_op op;
+		} notify_params;
+	};
+};
+
 /**
  * struct llcc_edac_reg_data - llcc edac registers data for each error type
  * @name: Name of the error
@@ -201,7 +222,28 @@ int llcc_slice_activate(struct llcc_slice_desc *desc);
  */
 int llcc_slice_deactivate(struct llcc_slice_desc *desc);
 
+bool llcc_is_notif_staling_supported(void);
+int llcc_configure_staling_mode(struct llcc_slice_desc *desc,
+			       struct llcc_staling_mode_params *params);
+int llcc_notif_staling_inc_counter(struct llcc_slice_desc *desc);
+
 #else
+static inline bool llcc_is_notif_staling_supported(void)
+{
+	return false;
+}
+
+static inline int llcc_configure_staling_mode(struct llcc_slice_desc *desc,
+				      struct llcc_staling_mode_params *params)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int llcc_notif_staling_inc_counter(struct llcc_slice_desc *desc)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline struct llcc_slice_desc *llcc_slice_getd(u32 uid)
 {
 	return NULL;
