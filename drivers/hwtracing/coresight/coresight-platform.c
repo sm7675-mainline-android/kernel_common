@@ -184,6 +184,53 @@ static int of_coresight_get_cpu(struct device *dev)
 }
 
 /*
+ * of_coresight_secure: Check whether the device is a secure node
+ *
+ * Return true, it means this is a secure node.
+ */
+bool of_coresight_secure_node(struct coresight_device *csdev)
+{
+	return of_property_read_bool(csdev->dev.parent->of_node,
+				     "qcom,secure-component");
+}
+
+/*
+ * of_coresight_get_csr_atid_offset: Get the csr atid register offset of a sink device.
+ *
+ * Returns the csr atid offset. If the result is less than zero, it means
+ * failure.
+ */
+int of_coresight_get_csr_atid_offset(struct coresight_device *csdev,
+				     u32 *atid_offset)
+{
+	return of_property_read_u32(csdev->dev.parent->of_node,
+				    "csr-atid-offset", atid_offset);
+}
+
+/*
+ * of_coresight_get_atid_number: Get the atid number of a source device.
+ *
+ * Returns the number of the atid. If the result is less than zero, it means
+ * failure.
+ */
+int of_coresight_get_atid_number(struct coresight_device *csdev)
+{
+	return of_property_count_u32_elems(csdev->dev.parent->of_node, "atid");
+}
+
+/*
+ * of_coresight_get_atid: Get the atid array of a source device.
+ *
+ * Returns 0 on success.
+ */
+int of_coresight_get_atid(struct coresight_device *csdev, u32 *atid,
+			  int atid_num)
+{
+	return of_property_read_u32_array(csdev->dev.parent->of_node, "atid",
+					  atid, atid_num);
+}
+
+/*
  * of_coresight_parse_endpoint : Parse the given output endpoint @ep
  * and fill the connection information in @pdata->out_conns
  *

@@ -173,6 +173,21 @@ struct cti_assoc_op {
 void coresight_set_cti_ops(const struct cti_assoc_op *cti_op);
 void coresight_remove_cti_ops(void);
 
+struct csr_set_atid_op {
+	int (*set_atid)(struct coresight_device *csdev, u32 atid_offset,
+			u32 atid, bool enable);
+};
+
+void coresight_set_csr_ops(const struct csr_set_atid_op *csr_op);
+void coresight_remove_csr_ops(void);
+
+bool of_coresight_secure_node(struct coresight_device *csdev);
+int of_coresight_get_csr_atid_offset(struct coresight_device *csdev,
+				     u32 *atid_offset);
+int of_coresight_get_atid_number(struct coresight_device *csdev);
+int of_coresight_get_atid(struct coresight_device *csdev, u32 *atid,
+			  int atid_num);
+
 /*
  * Macros and inline functions to handle CoreSight UCI data and driver
  * private data in AMBA ID table entries, and extract data values.
