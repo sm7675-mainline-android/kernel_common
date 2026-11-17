@@ -1076,7 +1076,6 @@ int device_links_check_suppliers(struct device *dev)
 
 		if (link->status != DL_STATE_AVAILABLE &&
 		    !device_link_test(link, DL_FLAG_SYNC_STATE_ONLY)) {
-
 			if (dev_is_best_effort(dev) &&
 			    device_link_test(link, DL_FLAG_INFERRED) &&
 			    !link->supplier->can_match) {
@@ -1784,8 +1783,12 @@ static int fw_devlink_dev_sync_state(struct device *dev, void *data)
 		return 0;
 
 	if (fw_devlink_sync_state == FW_DEVLINK_SYNC_STATE_STRICT) {
-		dev_info(sup, "sync_state() pending due to %s\n",
-			 dev_name(link->consumer));
+		/*
+		 * Keep repeated supplier sync-state diagnostics behind
+		 * dynamic debug.
+		 */
+		dev_dbg(sup, "sync_state() pending due to %s\n",
+			dev_name(link->consumer));
 		return 0;
 	}
 

@@ -1288,6 +1288,12 @@ int of_phandle_iterator_init(struct of_phandle_iterator *it,
 	const __be32 *list;
 	int size;
 
+	if (WARN_ON_ONCE(!np || !list_name)) {
+		pr_err("phandle iterator invalid args node=%p list=%s caller=%pS\n",
+		       np, list_name ?: "<null>", (void *)_RET_IP_);
+		return -EINVAL;
+	}
+
 	memset(it, 0, sizeof(*it));
 
 	/*
