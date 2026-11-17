@@ -6,6 +6,7 @@
 #include <linux/auxiliary_bus.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/property.h>
 #include <linux/soc/qcom/pdr.h>
@@ -255,14 +256,20 @@ static void pmic_glink_ucsi_register(struct work_struct *work)
 	struct pmic_glink_ucsi *ucsi = container_of(work, struct pmic_glink_ucsi, register_work);
 	unsigned long flags;
 	bool pd_running;
+	int ret;
 
 	spin_lock_irqsave(&ucsi->state_lock, flags);
 	pd_running = ucsi->pd_running;
 	spin_unlock_irqrestore(&ucsi->state_lock, flags);
 
 	if (!ucsi->ucsi_registered && pd_running) {
-		ucsi_register(ucsi->ucsi);
+		ret = ucsi_register(ucsi->ucsi);
+		if (ret) {
+			dev_err(ucsi->dev, "USB DIAG UCSI register failed rc=%d\n", ret);
+			return;
+		}
 		ucsi->ucsi_registered = true;
+		dev_dbg(ucsi->dev, "USB DIAG UCSI registered version=%x\n", ucsi->ucsi->version);
 	} else if (ucsi->ucsi_registered && !pd_running) {
 		ucsi_unregister(ucsi->ucsi);
 		ucsi->ucsi_registered = false;
@@ -295,6 +302,7 @@ static void pmic_glink_ucsi_pdr_notify(void *priv, int state)
 	spin_lock_irqsave(&ucsi->state_lock, flags);
 	ucsi->pd_running = (state == SERVREG_SERVICE_STATE_UP);
 	spin_unlock_irqrestore(&ucsi->state_lock, flags);
+	dev_dbg(ucsi->dev, "USB DIAG UCSI service state=%d\n", state);
 	schedule_work(&ucsi->register_work);
 }
 
@@ -364,6 +372,13 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
 		u32 port;
 
 		ret = fwnode_property_read_u32(fwnode, "reg", &port);
+		if (ret && !fwnode_property_present(fwnode, "reg") &&
+		    of_device_is_compatible(dev->of_node, "qcom,ucsi-glink") &&
+		    of_get_available_child_count(dev->of_node) == 1 &&
+		    of_node_name_eq(to_of_node(fwnode), "connector")) {
+			port = 0;
+			ret = 0;
+		}
 		if (ret < 0) {
 			dev_err(dev, "missing reg property of %pOFn\n", fwnode);
 			return ret;
@@ -395,6 +410,7 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
 		return PTR_ERR(ucsi->client);
 
 	pmic_glink_client_register(ucsi->client);
+	dev_dbg(dev, "USB DIAG UCSI client ready node=%pOF\n", dev->of_node);
 
 	return 0;
 }
@@ -403,8 +419,11 @@ static void pmic_glink_ucsi_remove(struct auxiliary_device *adev)
 {
 	struct pmic_glink_ucsi *ucsi = dev_get_drvdata(&adev->dev);
 
-	/* Unregister first to stop having read & writes */
-	ucsi_unregister(ucsi->ucsi);
+	pmic_glink_client_unregister(ucsi->client);
+	cancel_work_sync(&ucsi->register_work);
+	cancel_work_sync(&ucsi->notify_work);
+	if (ucsi->ucsi_registered)
+		ucsi_unregister(ucsi->ucsi);
 }
 
 static const struct auxiliary_device_id pmic_glink_ucsi_id_table[] = {

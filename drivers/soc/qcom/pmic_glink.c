@@ -8,6 +8,7 @@
 #include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/rpmsg.h>
 #include <linux/slab.h>
@@ -16,6 +17,8 @@
 #include <linux/spinlock.h>
 
 #define PMIC_GLINK_SEND_TIMEOUT (5 * HZ)
+#define PMIC_GLINK_PRIMARY_CHANNEL "PMIC_RTR_ADSP_APPS"
+#define PMIC_GLINK_LOG_CHANNEL "PMIC_LOGS_ADSP_APPS"
 
 enum {
 	PMIC_GLINK_CLIENT_BATT = 0,
@@ -26,6 +29,8 @@ enum {
 struct pmic_glink {
 	struct device *dev;
 	struct pdr_handle *pdr;
+	struct list_head node;
+	const char *channel_name;
 
 	struct rpmsg_endpoint *ept;
 
@@ -34,6 +39,7 @@ struct pmic_glink {
 	struct auxiliary_device altmode_aux;
 	struct auxiliary_device ps_aux;
 	struct auxiliary_device ucsi_aux;
+	struct platform_device *battery_pdev;
 
 	/* serializing client_state and pdr_state updates */
 	struct mutex state_lock;
@@ -45,7 +51,7 @@ struct pmic_glink {
 	struct list_head clients;
 };
 
-static struct pmic_glink *__pmic_glink;
+static LIST_HEAD(pmic_glink_devices);
 static DEFINE_MUTEX(__pmic_glink_lock);
 
 struct pmic_glink_client {
@@ -66,9 +72,30 @@ static void _devm_pmic_glink_release_client(struct device *dev, void *res)
 	unsigned long flags;
 
 	spin_lock_irqsave(&pg->client_lock, flags);
-	list_del(&client->node);
+	if (!list_empty(&client->node))
+		list_del_init(&client->node);
 	spin_unlock_irqrestore(&pg->client_lock, flags);
 }
+
+static void _pmic_glink_client_unregister(struct pmic_glink_client *client)
+{
+	struct pmic_glink *pg = client->pg;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pg->client_lock, flags);
+	if (!list_empty(&client->node))
+		list_del_init(&client->node);
+	spin_unlock_irqrestore(&pg->client_lock, flags);
+}
+
+void pmic_glink_client_unregister(struct pmic_glink_client *client)
+{
+	if (!client)
+		return;
+
+	_pmic_glink_client_unregister(client);
+}
+EXPORT_SYMBOL_GPL(pmic_glink_client_unregister);
 
 struct pmic_glink_client *devm_pmic_glink_client_alloc(struct device *dev,
 						       unsigned int id,
@@ -150,6 +177,9 @@ static int pmic_glink_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	struct pmic_glink *pg = dev_get_drvdata(&rpdev->dev);
 	unsigned long flags;
 
+	if (!pg)
+		return 0;
+
 	if (len < sizeof(*hdr)) {
 		dev_warn(pg->dev, "ignoring truncated message\n");
 		return 0;
@@ -177,12 +207,16 @@ static int pmic_glink_add_aux_device(struct pmic_glink *pg,
 				     const char *name)
 {
 	struct device *parent = pg->dev;
+	struct device_node *node = NULL;
 	int ret;
 
 	aux->name = name;
 	aux->dev.parent = parent;
 	aux->dev.release = pmic_glink_aux_release;
-	device_set_of_node_from_dev(&aux->dev, parent);
+	if (!strcmp(name, "ucsi"))
+		node = of_get_compatible_child(parent->of_node, "qcom,ucsi-glink");
+	aux->dev.of_node = node ? node : of_node_get(parent->of_node);
+	aux->dev.of_node_reused = true;
 	ret = auxiliary_device_init(aux);
 	if (ret) {
 		of_node_put(aux->dev.of_node);
@@ -218,6 +252,8 @@ static void pmic_glink_state_notify_clients(struct pmic_glink *pg)
 	}
 
 	if (new_state != pg->client_state) {
+		dev_dbg(pg->dev, "USB DIAG glink channel=%s state=%u pdr=%u endpoint=%u\n",
+			 pg->channel_name, new_state, pg->pdr_state, !!pg->ept);
 		spin_lock_irqsave(&pg->client_lock, flags);
 		list_for_each_entry(client, &pg->clients, node)
 			client->pdr_notify(client->priv, new_state);
@@ -238,17 +274,28 @@ static void pmic_glink_pdr_callback(int state, char *svc_path, void *priv)
 
 static int pmic_glink_rpmsg_probe(struct rpmsg_device *rpdev)
 {
-	struct pmic_glink *pg;
+	struct pmic_glink *pg, *candidate;
 
 	guard(mutex)(&__pmic_glink_lock);
-	pg = __pmic_glink;
+	pg = NULL;
+	list_for_each_entry(candidate, &pmic_glink_devices, node) {
+		if (!strcmp(candidate->channel_name, rpdev->id.name)) {
+			pg = candidate;
+			break;
+		}
+	}
 	if (!pg)
-		return dev_err_probe(&rpdev->dev, -ENODEV, "no pmic_glink device to attach to\n");
+		return dev_err_probe(&rpdev->dev, -EPROBE_DEFER,
+				     "no pmic_glink transport for %s\n", rpdev->id.name);
+
+	if (!device_link_add(&rpdev->dev, pg->dev, DL_FLAG_AUTOREMOVE_CONSUMER))
+		return -EINVAL;
 
 	dev_set_drvdata(&rpdev->dev, pg);
 
 	guard(mutex)(&pg->state_lock);
 	pg->ept = rpdev->ept;
+	dev_dbg(pg->dev, "USB DIAG glink endpoint attached channel=%s\n", pg->channel_name);
 	pmic_glink_state_notify_clients(pg);
 
 	return 0;
@@ -256,10 +303,8 @@ static int pmic_glink_rpmsg_probe(struct rpmsg_device *rpdev)
 
 static void pmic_glink_rpmsg_remove(struct rpmsg_device *rpdev)
 {
-	struct pmic_glink *pg;
+	struct pmic_glink *pg = dev_get_drvdata(&rpdev->dev);
 
-	guard(mutex)(&__pmic_glink_lock);
-	pg = __pmic_glink;
 	if (!pg)
 		return;
 
@@ -269,7 +314,8 @@ static void pmic_glink_rpmsg_remove(struct rpmsg_device *rpdev)
 }
 
 static const struct rpmsg_device_id pmic_glink_rpmsg_id_match[] = {
-	{ "PMIC_RTR_ADSP_APPS" },
+	{ PMIC_GLINK_PRIMARY_CHANNEL },
+	{ PMIC_GLINK_LOG_CHANNEL },
 	{}
 };
 
@@ -286,8 +332,11 @@ static struct rpmsg_driver pmic_glink_rpmsg_driver = {
 static int pmic_glink_probe(struct platform_device *pdev)
 {
 	const unsigned long *match_data;
+	struct device_node *charger_node __free(device_node) = NULL;
 	struct pdr_service *service;
 	struct pmic_glink *pg;
+	const char *service_name = "tms/servreg";
+	const char *service_path = "msm/adsp/charger_pd";
 	int ret;
 
 	pg = devm_kzalloc(&pdev->dev, sizeof(*pg), GFP_KERNEL);
@@ -297,6 +346,17 @@ static int pmic_glink_probe(struct platform_device *pdev)
 	dev_set_drvdata(&pdev->dev, pg);
 
 	pg->dev = &pdev->dev;
+	pg->channel_name = PMIC_GLINK_PRIMARY_CHANNEL;
+	if (of_property_present(pdev->dev.of_node, "qcom,pmic-glink-channel")) {
+		ret = of_property_read_string(pdev->dev.of_node, "qcom,pmic-glink-channel",
+					      &pg->channel_name);
+		if (ret)
+			return ret;
+	}
+	if (strcmp(pg->channel_name, PMIC_GLINK_PRIMARY_CHANNEL) &&
+	    strcmp(pg->channel_name, PMIC_GLINK_LOG_CHANNEL))
+		return dev_err_probe(&pdev->dev, -EINVAL, "unsupported glink channel %s\n",
+				     pg->channel_name);
 
 	INIT_LIST_HEAD(&pg->clients);
 	spin_lock_init(&pg->client_lock);
@@ -307,12 +367,32 @@ static int pmic_glink_probe(struct platform_device *pdev)
 		return -EINVAL;
 
 	pg->client_mask = *match_data;
+	if (strcmp(pg->channel_name, PMIC_GLINK_PRIMARY_CHANNEL))
+		pg->client_mask = 0;
+	charger_node = of_get_child_by_name(pdev->dev.of_node, "qcom,battery_charger");
+	if (of_device_is_available(charger_node))
+		pg->client_mask &= ~BIT(PMIC_GLINK_CLIENT_BATT);
 
-	pg->pdr = pdr_handle_alloc(pmic_glink_pdr_callback, pg);
-	if (IS_ERR(pg->pdr)) {
-		ret = dev_err_probe(&pdev->dev, PTR_ERR(pg->pdr),
-				    "failed to initialize pdr\n");
-		return ret;
+	if (of_property_present(pdev->dev.of_node, "qcom,protection-domain")) {
+		ret = of_property_read_string_index(pdev->dev.of_node,
+				"qcom,protection-domain", 0, &service_name);
+		if (ret)
+			return ret;
+		ret = of_property_read_string_index(pdev->dev.of_node,
+				"qcom,protection-domain", 1, &service_path);
+		if (ret)
+			return ret;
+	} else if (!pg->client_mask) {
+		service_name = NULL;
+	}
+
+	if (service_name) {
+		pg->pdr = pdr_handle_alloc(pmic_glink_pdr_callback, pg);
+		if (IS_ERR(pg->pdr))
+			return dev_err_probe(&pdev->dev, PTR_ERR(pg->pdr),
+					     "failed to initialize pdr\n");
+	} else {
+		pg->pdr_state = SERVREG_SERVICE_STATE_UP;
 	}
 
 	if (pg->client_mask & BIT(PMIC_GLINK_CLIENT_UCSI)) {
@@ -331,16 +411,30 @@ static int pmic_glink_probe(struct platform_device *pdev)
 			goto out_release_altmode_aux;
 	}
 
-	service = pdr_add_lookup(pg->pdr, "tms/servreg", "msm/adsp/charger_pd");
-	if (IS_ERR(service)) {
-		ret = dev_err_probe(&pdev->dev, PTR_ERR(service),
-				    "failed adding pdr lookup for charger_pd\n");
-		goto out_release_aux_devices;
+	if (pg->pdr) {
+		service = pdr_add_lookup(pg->pdr, service_name, service_path);
+		if (IS_ERR(service)) {
+			ret = dev_err_probe(&pdev->dev, PTR_ERR(service),
+					    "failed adding pdr lookup for %s\n", service_path);
+			goto out_release_aux_devices;
+		}
+	}
+
+	if (of_device_is_available(charger_node)) {
+		pg->battery_pdev = of_platform_device_create(charger_node, NULL, &pdev->dev);
+		if (!pg->battery_pdev) {
+			ret = -ENODEV;
+			goto out_release_aux_devices;
+		}
+		dev_dbg(pg->dev, "CHG DIAG created charger device %s\n",
+			 dev_name(&pg->battery_pdev->dev));
 	}
 
 	mutex_lock(&__pmic_glink_lock);
-	__pmic_glink = pg;
+	list_add_tail(&pg->node, &pmic_glink_devices);
 	mutex_unlock(&__pmic_glink_lock);
+	dev_dbg(pg->dev, "USB DIAG glink transport ready channel=%s clients=%lx pdr=%u\n",
+		 pg->channel_name, pg->client_mask, !!pg->pdr);
 
 	return 0;
 
@@ -354,7 +448,8 @@ out_release_ucsi_aux:
 	if (pg->client_mask & BIT(PMIC_GLINK_CLIENT_UCSI))
 		pmic_glink_del_aux_device(pg, &pg->ucsi_aux);
 out_release_pdr_handle:
-	pdr_handle_release(pg->pdr);
+	if (pg->pdr)
+		pdr_handle_release(pg->pdr);
 
 	return ret;
 }
@@ -363,7 +458,15 @@ static void pmic_glink_remove(struct platform_device *pdev)
 {
 	struct pmic_glink *pg = dev_get_drvdata(&pdev->dev);
 
-	pdr_handle_release(pg->pdr);
+	if (pg->battery_pdev)
+		of_platform_device_destroy(&pg->battery_pdev->dev, NULL);
+
+	mutex_lock(&__pmic_glink_lock);
+	list_del(&pg->node);
+	mutex_unlock(&__pmic_glink_lock);
+
+	if (pg->pdr)
+		pdr_handle_release(pg->pdr);
 
 	if (pg->client_mask & BIT(PMIC_GLINK_CLIENT_BATT))
 		pmic_glink_del_aux_device(pg, &pg->ps_aux);
@@ -372,8 +475,6 @@ static void pmic_glink_remove(struct platform_device *pdev)
 	if (pg->client_mask & BIT(PMIC_GLINK_CLIENT_UCSI))
 		pmic_glink_del_aux_device(pg, &pg->ucsi_aux);
 
-	guard(mutex)(&__pmic_glink_lock);
-	__pmic_glink = NULL;
 }
 
 static const unsigned long pmic_glink_sm8450_client_mask = BIT(PMIC_GLINK_CLIENT_BATT) |
