@@ -33,7 +33,7 @@ config CRC_CCITT
 	  of the functions from <linux/crc-ccitt.h>.
 
 config CRC_ITU_T
-	tristate
+	tristate "CRC-ITU-T functions"
 	help
 	  The CRC-ITU-T library functions.  Select this if your module uses
 	  any of the functions from <linux/crc-itu-t.h>.

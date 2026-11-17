@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 
 config DRM_DISPLAY_DP_AUX_BUS
-	tristate
+	tristate "DRM DisplayPort AUX bus"
 	depends on DRM
 	depends on OF
 

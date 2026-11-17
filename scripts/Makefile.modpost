@@ -149,6 +149,9 @@ else
 modpost-args += vmlinux.o
 modpost-deps += vmlinux.o
 output-symdump := $(if $(KBUILD_MODULES), Module.symvers, vmlinux.symvers)
+# Vendor modules are built out of tree; let modpost resolve their exports.
+modpost-args += $(addprefix -i ,$(KBUILD_EXTRA_SYMBOLS))
+modpost-deps += $(KBUILD_EXTRA_SYMBOLS)
 endif
 
 else
