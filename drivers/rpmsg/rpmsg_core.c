@@ -492,7 +492,8 @@ static int rpmsg_dev_probe(struct device *dev)
 
 	err = rpdrv->probe(rpdev);
 	if (err) {
-		dev_err(dev, "%s: failed: %d\n", __func__, err);
+		if (err != -EPROBE_DEFER)
+			dev_err(dev, "%s: failed: %d\n", __func__, err);
 		goto destroy_ept;
 	}
 

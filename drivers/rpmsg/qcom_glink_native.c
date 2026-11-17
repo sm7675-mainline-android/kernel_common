@@ -11,11 +11,14 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_irq.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/regmap.h>
 #include <linux/rpmsg.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/termios.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/mailbox_client.h>
@@ -126,6 +129,7 @@ struct qcom_glink {
 	bool sent_read_notify;
 
 	bool abort_tx;
+	bool irq_requested;
 };
 
 enum {
@@ -191,6 +195,10 @@ struct glink_channel {
 	int intent_req_result;
 	bool intent_received;
 	wait_queue_head_t intent_req_wq;
+
+	unsigned int local_signals;
+	unsigned int remote_signals;
+	int (*signals_cb)(struct rpmsg_device *dev, void *priv, u32 old, u32 new);
 };
 
 #define to_glink_channel(_ept) container_of(_ept, struct glink_channel, ept)
@@ -219,6 +227,8 @@ static const struct rpmsg_endpoint_ops glink_endpoint_ops;
 #define NATIVE_DSR_SIG			BIT(31)
 #define NATIVE_RTS_SIG			NATIVE_CTS_SIG
 #define NATIVE_CTS_SIG			BIT(30)
+#define NATIVE_CD_SIG			BIT(29)
+#define NATIVE_RI_SIG			BIT(28)
 
 static void qcom_glink_rx_done_work(struct work_struct *work);
 
@@ -592,9 +602,9 @@ static void qcom_glink_rx_done_work(struct work_struct *work)
 	spin_unlock_irqrestore(&channel->intent_lock, flags);
 }
 
-static void qcom_glink_rx_done(struct qcom_glink *glink,
-			       struct glink_channel *channel,
-			       struct glink_core_rx_intent *intent)
+static void qcom_glink_send_rx_done(struct qcom_glink *glink,
+				    struct glink_channel *channel,
+				    struct glink_core_rx_intent *intent)
 {
 	/* We don't send RX_DONE to intentless systems */
 	if (glink->intentless) {
@@ -1004,7 +1014,7 @@ static int qcom_glink_rx_data(struct qcom_glink *glink, size_t avail)
 		intent->offset = 0;
 		channel->buf = NULL;
 
-		qcom_glink_rx_done(glink, channel, intent);
+		qcom_glink_send_rx_done(glink, channel, intent);
 	}
 
 advance_rx:
@@ -1148,6 +1158,7 @@ static void qcom_glink_handle_signals(struct qcom_glink *glink,
 {
 	struct glink_channel *channel;
 	unsigned long flags;
+	unsigned int old;
 	bool enable;
 
 	qcom_glink_rx_advance(glink, ALIGN(sizeof(struct glink_msg), 8));
@@ -1167,7 +1178,127 @@ static void qcom_glink_handle_signals(struct qcom_glink *glink,
 
 	if (channel->ept.flow_cb)
 		channel->ept.flow_cb(channel->ept.rpdev, channel->ept.priv, enable);
+
+	old = channel->remote_signals;
+	if (sigs & NATIVE_DTR_SIG)
+		sigs |= TIOCM_DSR;
+	if (sigs & NATIVE_CTS_SIG)
+		sigs |= TIOCM_CTS;
+	if (sigs & NATIVE_CD_SIG)
+		sigs |= TIOCM_CD;
+	if (sigs & NATIVE_RI_SIG)
+		sigs |= TIOCM_RI;
+	sigs &= 0x0fff;
+
+	channel->remote_signals = sigs;
+	if (channel->signals_cb)
+		channel->signals_cb(channel->ept.rpdev, channel->ept.priv,
+				    old, channel->remote_signals);
 }
+
+/*
+ * The downstream glink_pkt client uses the TIOCM signal API.  The upstream
+ * driver only exposes pause/resume flow control, so provide the same wire
+ * format helpers that the Qualcomm tree exports.
+ */
+static int qcom_glink_send_signals(struct qcom_glink *glink,
+				   struct glink_channel *channel,
+				   u32 signals)
+{
+	struct glink_msg msg;
+
+	signals &= 0x0fff;
+	if (signals & TIOCM_DTR)
+		signals |= NATIVE_DTR_SIG;
+	if (signals & TIOCM_RTS)
+		signals |= NATIVE_CTS_SIG;
+	if (signals & TIOCM_CD)
+		signals |= NATIVE_CD_SIG;
+	if (signals & TIOCM_RI)
+		signals |= NATIVE_RI_SIG;
+
+	msg.cmd = cpu_to_le16(GLINK_CMD_SIGNALS);
+	msg.param1 = cpu_to_le16(channel->lcid);
+	msg.param2 = cpu_to_le32(signals);
+
+	return qcom_glink_tx(glink, &msg, sizeof(msg), NULL, 0, true);
+}
+
+int qcom_glink_get_signals(struct rpmsg_endpoint *ept)
+{
+	struct glink_channel *channel;
+
+	if (!ept)
+		return 0;
+
+	channel = to_glink_channel(ept);
+
+	return channel->remote_signals;
+}
+EXPORT_SYMBOL(qcom_glink_get_signals);
+
+int qcom_glink_set_signals(struct rpmsg_endpoint *ept, u32 set, u32 clear)
+{
+	struct glink_channel *channel;
+	struct qcom_glink *glink;
+	u32 signals;
+
+	if (!ept)
+		return -EINVAL;
+
+	channel = to_glink_channel(ept);
+	glink = channel->glink;
+	signals = channel->local_signals;
+
+	if (set & TIOCM_DTR)
+		signals |= TIOCM_DTR;
+	if (set & TIOCM_RTS)
+		signals |= TIOCM_RTS;
+	if (set & TIOCM_CD)
+		signals |= TIOCM_CD;
+	if (set & TIOCM_RI)
+		signals |= TIOCM_RI;
+	if (clear & TIOCM_DTR)
+		signals &= ~TIOCM_DTR;
+	if (clear & TIOCM_RTS)
+		signals &= ~TIOCM_RTS;
+	if (clear & TIOCM_CD)
+		signals &= ~TIOCM_CD;
+	if (clear & TIOCM_RI)
+		signals &= ~TIOCM_RI;
+
+	channel->local_signals = signals;
+
+	return qcom_glink_send_signals(glink, channel, signals);
+}
+EXPORT_SYMBOL(qcom_glink_set_signals);
+
+int qcom_glink_register_signals_cb(struct rpmsg_endpoint *ept,
+				   int (*cb)(struct rpmsg_device *, void *, u32, u32))
+{
+	struct glink_channel *channel;
+
+	if (!ept || !cb)
+		return -EINVAL;
+
+	channel = to_glink_channel(ept);
+	channel->signals_cb = cb;
+
+	return 0;
+}
+EXPORT_SYMBOL(qcom_glink_register_signals_cb);
+
+bool qcom_glink_rx_done_supported(struct rpmsg_endpoint *ept)
+{
+	return false;
+}
+EXPORT_SYMBOL(qcom_glink_rx_done_supported);
+
+int qcom_glink_rx_done(struct rpmsg_endpoint *ept, void *data)
+{
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(qcom_glink_rx_done);
 
 void qcom_glink_native_rx(struct qcom_glink *glink)
 {
@@ -1994,6 +2125,67 @@ void qcom_glink_native_remove(struct qcom_glink *glink)
 	idr_destroy(&glink->rcids);
 }
 EXPORT_SYMBOL_GPL(qcom_glink_native_remove);
+
+static irqreturn_t qcom_glink_native_intr(int irq, void *data)
+{
+	return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t qcom_glink_native_thread_intr(int irq, void *data)
+{
+	struct qcom_glink *glink = data;
+
+	qcom_glink_native_rx(glink);
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * The SPSS transport (downstream driver) does not request its own IRQ and
+ * relies on the native driver to do it.  The SMEM transport registers its IRQ
+ * itself and never calls this function, so this only runs for SPSS.
+ */
+int qcom_glink_native_start(struct qcom_glink *glink)
+{
+	struct device *dev = glink->dev;
+	int irq;
+	int ret;
+
+	if (glink->irq_requested)
+		return 0;
+
+	irq = of_irq_get(dev->of_node, 0);
+	if (irq <= 0)
+		return 0;
+
+	ret = devm_request_threaded_irq(dev, irq, qcom_glink_native_intr,
+					qcom_glink_native_thread_intr,
+					IRQF_NO_SUSPEND | IRQF_ONESHOT,
+					dev_name(dev), glink);
+	if (ret) {
+		dev_err(dev, "failed to request IRQ %d: %d\n", irq, ret);
+		return ret;
+	}
+
+	glink->irq_requested = true;
+
+	return 0;
+}
+EXPORT_SYMBOL(qcom_glink_native_start);
+
+/*
+ * Upstream qcom_glink_native_probe() no longer creates a device of its own;
+ * the transport owns it.  Keep the downstream symbol as a no-op so vendor
+ * transports can unregister without tearing down their parent device.
+ */
+void qcom_glink_native_unregister(struct qcom_glink *glink)
+{
+}
+EXPORT_SYMBOL_GPL(qcom_glink_native_unregister);
+
+const struct dev_pm_ops glink_native_pm_ops = {
+};
+EXPORT_SYMBOL(glink_native_pm_ops);
 
 MODULE_DESCRIPTION("Qualcomm GLINK driver");
 MODULE_LICENSE("GPL v2");
