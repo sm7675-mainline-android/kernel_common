@@ -13,6 +13,7 @@
 #include <linux/firmware/qcom/qcom_tzmem.h>
 #include <linux/arm-smccc.h>
 #include <linux/dma-mapping.h>
+#include <linux/qtee_shmbridge.h>
 
 #include "qcom_scm.h"
 
@@ -67,6 +68,21 @@ static void fill_wq_resume_args(struct arm_smccc_args *resume, u32 smc_call_ctx)
 	resume->args[2] = smc_call_ctx;
 }
 
+/* Multi-SMC firmware requires WAITQ_ACK for inline wake notifications. */
+static void fill_wq_wake_ack_args(struct arm_smccc_args *wake_ack,
+				  u32 smc_call_ctx)
+{
+	memset(wake_ack->args, 0, sizeof(wake_ack->args[0]) * ARRAY_SIZE(wake_ack->args));
+
+	wake_ack->args[0] = ARM_SMCCC_CALL_VAL(ARM_SMCCC_STD_CALL,
+					ARM_SMCCC_SMC_64, ARM_SMCCC_OWNER_SIP,
+					SCM_SMC_FNID(QCOM_SCM_SVC_WAITQ, QCOM_SCM_WAITQ_ACK));
+
+	wake_ack->args[1] = QCOM_SCM_ARGS(1);
+
+	wake_ack->args[2] = smc_call_ctx;
+}
+
 int scm_get_wq_ctx(u32 *wq_ctx, u32 *flags, u32 *more_pending)
 {
 	int ret;
@@ -94,25 +110,36 @@ static int __scm_smc_do_quirk_handle_waitq(struct device *dev, struct arm_smccc_
 					   struct arm_smccc_res *res)
 {
 	int ret;
-	u32 wq_ctx, smc_call_ctx;
+	u32 wq_ctx, smc_call_ctx, flags;
 	struct arm_smccc_args resume;
 	struct arm_smccc_args *smc = waitq;
 
 	do {
 		__scm_smc_do_quirk(smc, res);
 
-		if (res->a0 == QCOM_SCM_WAITQ_SLEEP) {
+		if (res->a0 == QCOM_SCM_WAITQ_SLEEP ||
+		    res->a0 == QCOM_SCM_WAITQ_WAKE) {
 			wq_ctx = res->a1;
 			smc_call_ctx = res->a2;
+			flags = res->a3;
 
-			ret = qcom_scm_wait_for_wq_completion(wq_ctx);
-			if (ret)
-				return ret;
-
-			fill_wq_resume_args(&resume, smc_call_ctx);
+			if (res->a0 == QCOM_SCM_WAITQ_SLEEP) {
+				ret = qcom_scm_wait_for_wq_completion(wq_ctx);
+				if (ret)
+					return ret;
+				fill_wq_resume_args(&resume, smc_call_ctx);
+			} else {
+				/*
+				 * Acknowledge the wake notification before
+				 * resuming the call.
+				 */
+				qcom_scm_waitq_flag_handler(wq_ctx, flags);
+				fill_wq_wake_ack_args(&resume, smc_call_ctx);
+			}
 			smc = &resume;
 		}
-	} while (res->a0 == QCOM_SCM_WAITQ_SLEEP);
+	} while (res->a0 == QCOM_SCM_WAITQ_SLEEP ||
+		 res->a0 == QCOM_SCM_WAITQ_WAKE);
 
 	return 0;
 }
@@ -154,7 +181,11 @@ int __scm_smc_call(struct device *dev, const struct qcom_scm_desc *desc,
 {
 	int arglen = desc->arginfo & 0xf;
 	int i, ret;
-	void *args_virt __free(qcom_tzmem) = NULL;
+	void *tzm_virt __free(qcom_tzmem) = NULL;
+	void *args_virt = NULL;
+	bool use_shmbridge = false;
+	phys_addr_t shm_paddr = 0;
+	struct qtee_shm shm = {0};
 	gfp_t flag = atomic ? GFP_ATOMIC : GFP_KERNEL;
 	u32 smccc_call_type = atomic ? ARM_SMCCC_FAST_CALL : ARM_SMCCC_STD_CALL;
 	u32 qcom_smccc_convention = (qcom_convention == SMC_CONVENTION_ARM_32) ?
@@ -172,16 +203,33 @@ int __scm_smc_call(struct device *dev, const struct qcom_scm_desc *desc,
 		smc.args[i + SCM_SMC_FIRST_REG_IDX] = desc->args[i];
 
 	if (unlikely(arglen > SCM_SMC_N_REG_ARGS)) {
-		struct qcom_tzmem_pool *mempool = qcom_scm_get_tzmem_pool();
+		struct qcom_tzmem_pool *mempool;
 
-		if (!mempool)
-			return -EINVAL;
+		/*
+		 * With SHM bridge enabled, firmware requires registered
+		 * memory for extended arguments.
+		 */
+		if (qtee_shmbridge_is_enabled()) {
+			ret = qtee_shmbridge_allocate_shm(
+					SCM_SMC_N_EXT_ARGS * sizeof(u64), &shm);
+			if (ret)
+				return ret;
+			args_virt = shm.vaddr;
+			shm_paddr = shm.paddr;
+			use_shmbridge = true;
+		} else {
+			mempool = qcom_scm_get_tzmem_pool();
+			if (!mempool)
+				return -EINVAL;
 
-		args_virt = qcom_tzmem_alloc(mempool,
-					     SCM_SMC_N_EXT_ARGS * sizeof(u64),
-					     flag);
-		if (!args_virt)
-			return -ENOMEM;
+			tzm_virt = qcom_tzmem_alloc(mempool,
+						    SCM_SMC_N_EXT_ARGS * sizeof(u64),
+						    flag);
+			if (!tzm_virt)
+				return -ENOMEM;
+			args_virt = tzm_virt;
+			shm_paddr = qcom_tzmem_to_phys(tzm_virt);
+		}
 
 		if (qcom_smccc_convention == ARM_SMCCC_SMC_32) {
 			__le32 *args = args_virt;
@@ -197,10 +245,19 @@ int __scm_smc_call(struct device *dev, const struct qcom_scm_desc *desc,
 						      SCM_SMC_FIRST_EXT_IDX]);
 		}
 
-		smc.args[SCM_SMC_LAST_REG_IDX] = qcom_tzmem_to_phys(args_virt);
+		if (use_shmbridge)
+			qtee_shmbridge_flush_shm_buf(&shm);
+
+		smc.args[SCM_SMC_LAST_REG_IDX] = shm_paddr;
 	}
 
 	ret = __scm_smc_do(dev, &smc, &smc_res, atomic);
+
+	if (use_shmbridge) {
+		qtee_shmbridge_inv_shm_buf(&shm);
+		qtee_shmbridge_free_shm(&shm);
+	}
+
 	if (ret)
 		return ret;
 

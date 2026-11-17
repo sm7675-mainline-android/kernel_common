@@ -7,6 +7,35 @@
 struct device;
 struct qcom_tzmem_pool;
 
+#define QCOM_SCM_CAMERA_MAX_QOS_CNT	2
+
+/*
+ * Downstream enum, also present in the vendor <linux/qcom_scm.h>.  Guarded so
+ * that including both headers (the vendor one shadows the in-tree one via
+ * -I ordering) does not produce a duplicate definition.
+ */
+#ifndef QCOM_DOWNLOAD_NODUMP
+enum qcom_download_mode {
+	QCOM_DOWNLOAD_NODUMP    = 0x00,
+	QCOM_DOWNLOAD_EDL       = 0x01,
+	QCOM_DOWNLOAD_FULLDUMP  = 0x10,
+	QCOM_DOWNLOAD_MINIDUMP  = 0x20,
+};
+#endif
+
+void qcom_scm_disable_sdi(void);
+void qcom_scm_set_download_mode(enum qcom_download_mode mode,
+				phys_addr_t tcsr_boot_misc);
+int qcom_scm_get_sec_dump_state(u32 *dump_state);
+int qcom_scm_mem_protect_region_id(phys_addr_t paddr, size_t size);
+int qcom_scm_pas_init_image(u32 peripheral, dma_addr_t metadata);
+
+
+struct qcom_scm_camera_qos {
+	u32 offset;
+	u32 val;
+};
+
 enum qcom_scm_convention {
 	SMC_CONVENTION_UNKNOWN,
 	SMC_CONVENTION_LEGACY,
@@ -67,6 +96,7 @@ struct qcom_scm_res {
 };
 
 int qcom_scm_wait_for_wq_completion(u32 wq_ctx);
+void qcom_scm_waitq_flag_handler(u32 wq_ctx, u32 flags);
 int scm_get_wq_ctx(u32 *wq_ctx, u32 *flags, u32 *more_pending);
 
 #define SCM_SMC_FNID(s, c)	((((s) & 0xFF) << 8) | ((c) & 0xFF))
@@ -91,6 +121,8 @@ int qcom_scm_shm_bridge_enable(struct device *scm_dev);
 #define QCOM_SCM_BOOT_SDI_CONFIG	0x09
 #define QCOM_SCM_BOOT_SET_DLOAD_MODE	0x10
 #define QCOM_SCM_BOOT_SET_ADDR_MC	0x11
+#define QCOM_SCM_BOOT_SEC_WDOG_DIS	0x07
+#define QCOM_SCM_BOOT_SEC_WDOG_TRIGGER	0x08
 #define QCOM_SCM_BOOT_SET_REMOTE_STATE	0x0a
 #define QCOM_SCM_FLUSH_FLAG_MASK	0x3
 #define QCOM_SCM_BOOT_MAX_CPUS		4
@@ -109,6 +141,12 @@ int qcom_scm_shm_bridge_enable(struct device *scm_dev);
 #define QCOM_SCM_SVC_IO			0x05
 #define QCOM_SCM_IO_READ		0x01
 #define QCOM_SCM_IO_WRITE		0x02
+#define QCOM_SCM_IO_RESET		0x03
+
+#define QCOM_SCM_SVC_UTIL		0x03
+#define QCOM_SCM_UTIL_GET_SEC_DUMP_STATE	0x10
+#define QCOM_SCM_MP_MEM_PROTECT_REGION_ID	0x10
+#define QCOM_SCM_UTIL_DUMP_TABLE_ASSIGN	0x13
 
 #define QCOM_SCM_SVC_INFO		0x06
 #define QCOM_SCM_INFO_IS_CALL_AVAIL	0x01
@@ -120,6 +158,7 @@ int qcom_scm_shm_bridge_enable(struct device *scm_dev);
 #define QCOM_SCM_MP_IOMMU_SET_CP_POOL_SIZE	0x05
 #define QCOM_SCM_MP_VIDEO_VAR			0x08
 #define QCOM_SCM_MP_ASSIGN			0x16
+#define QCOM_SCM_MP_CMD_SD_CTRL		0x18
 #define QCOM_SCM_MP_CP_SMMU_APERTURE_ID		0x1b
 #define QCOM_SCM_MP_SHM_BRIDGE_ENABLE		0x1c
 #define QCOM_SCM_MP_SHM_BRIDGE_DELETE		0x1d
@@ -132,6 +171,9 @@ int qcom_scm_shm_bridge_enable(struct device *scm_dev);
 #define QCOM_SCM_SVC_ES			0x10	/* Enterprise Security */
 #define QCOM_SCM_ES_INVALIDATE_ICE_KEY	0x03
 #define QCOM_SCM_ES_CONFIG_SET_ICE_KEY	0x04
+#define QCOM_SCM_ES_CONFIG_SET_ICE_KEY_V2	0x05
+#define QCOM_SCM_ES_CLEAR_ICE_KEY	0x06
+#define QCOM_SCM_ES_DERIVE_RAW_SECRET	0x07
 #define QCOM_SCM_ES_DERIVE_SW_SECRET	0x07
 #define QCOM_SCM_ES_GENERATE_ICE_KEY	0x08
 #define QCOM_SCM_ES_PREPARE_ICE_KEY	0x09
@@ -145,13 +187,32 @@ int qcom_scm_shm_bridge_enable(struct device *scm_dev);
 #define QCOM_SCM_LMH_LIMIT_DCVSH		0x10
 
 #define QCOM_SCM_SVC_SMMU_PROGRAM		0x15
+#define QCOM_SCM_SMMU_SECURE_LUT		0x03
+
+#define QCOM_SCM_SVC_CAMERA			0x18
+#define QCOM_SCM_CAMERA_PROTECT_ALL		0x05
+#define QCOM_SCM_CAMERA_PROTECT_PHY_LANES	0x07
+#define QCOM_SCM_CAMERA_UPDATE_CAMNOC_QOS	0x0A
 #define QCOM_SCM_SMMU_PT_FORMAT			0x01
 #define QCOM_SCM_SMMU_CONFIG_ERRATA1		0x03
 #define QCOM_SCM_SMMU_CONFIG_ERRATA1_CLIENT_ALL	0x02
 
 #define QCOM_SCM_SVC_WAITQ			0x24
+#define QCOM_SCM_WAITQ_ACK			0x01
 #define QCOM_SCM_WAITQ_RESUME			0x02
 #define QCOM_SCM_WAITQ_GET_WQ_CTX		0x03
+
+#define QCOM_SCM_SVC_DCVS			0x0D
+#define QCOM_SCM_DCVS_RESET			0x07
+#define QCOM_SCM_DCVS_UPDATE			0x08
+#define QCOM_SCM_DCVS_INIT			0x09
+#define QCOM_SCM_DCVS_UPDATE_V2			0x0a
+#define QCOM_SCM_DCVS_INIT_V2			0x0b
+#define QCOM_SCM_DCVS_INIT_CA_V2		0x0c
+#define QCOM_SCM_DCVS_UPDATE_CA_V2		0x0d
+
+#define QCOM_SCM_CP_APERTURE_REG		0x0
+#define QCOM_SCM_CP_LPAC_APERTURE_REG		0x1
 
 #define QCOM_SCM_SVC_GPU			0x28
 #define QCOM_SCM_SVC_GPU_INIT_REGS		0x01
@@ -172,6 +233,7 @@ int qcom_scm_shm_bridge_enable(struct device *scm_dev);
 #define QCOM_SCM_ERROR		-1
 #define QCOM_SCM_INTERRUPTED	1
 #define QCOM_SCM_WAITQ_SLEEP	2
+#define QCOM_SCM_WAITQ_WAKE	3
 
 static inline int qcom_scm_remap_error(int err)
 {
