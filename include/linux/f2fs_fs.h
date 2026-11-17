@@ -23,6 +23,12 @@
 #define NULL_ADDR		((block_t)0)	/* used as block_t addresses */
 #define NEW_ADDR		((block_t)-1)	/* used as block_t addresses */
 #define COMPRESS_ADDR		((block_t)-2)	/* used as compressed data flag */
+/*
+ * OPLUS/OnePlus reserves two more sentinel block addresses for its
+ * layered/dedup inode support. Mainline never writes them.
+ */
+#define DEDUP_ADDR		((block_t)-1024)
+#define SEQZONE_ADDR		((block_t)-1025)
 
 #define F2FS_BLKSIZE_MASK		(F2FS_BLKSIZE - 1)
 #define F2FS_BYTES_TO_BLK(bytes)	((unsigned long long)(bytes) >> F2FS_BLKSIZE_BITS)

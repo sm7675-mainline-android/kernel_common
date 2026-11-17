@@ -5329,6 +5329,28 @@ try_onemore:
 		err = PTR_ERR(root);
 		goto free_node_inode;
 	}
+#ifdef CONFIG_F2FS_OPLUS_INODE_LAYOUT
+	/*
+	 * Report which inline extra-attribute layout is actually on disk.
+	 * New inodes inherit it from their parent directory, so this single
+	 * line tells the operator whether the mount is using the mainline
+	 * 36-byte layout or the OPLUS 48-byte one.
+	 */
+	f2fs_info(sbi, "inline extra-attribute layout on disk: %d bytes (mainline %zu, OPLUS %zu)",
+		  F2FS_I(root)->i_extra_isize,
+		  (size_t)F2FS_TOTAL_EXTRA_ATTR_SIZE,
+		  (size_t)F2FS_OPLUS_EXTRA_ATTR_SIZE);
+
+	/*
+	 * OPLUS-only features cannot be honoured here. Mounting read-write is
+	 * still allowed so the data can be inspected or backed up, but warn
+	 * loudly: dedup/seqzone inodes are not understood.
+	 */
+	if (le32_to_cpu(sbi->raw_super->feature) & F2FS_FEATURE_OPLUS_MASK)
+		f2fs_warn(sbi, "filesystem carries OPLUS-only features 0x%x; dedup/seqzone inodes cannot be read safely",
+			  le32_to_cpu(sbi->raw_super->feature) &
+			  F2FS_FEATURE_OPLUS_MASK);
+#endif
 	if (!S_ISDIR(root->i_mode) || !root->i_blocks ||
 			!root->i_size || !root->i_nlink) {
 		iput(root);

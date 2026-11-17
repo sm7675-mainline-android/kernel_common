@@ -298,7 +298,7 @@ static struct inode *f2fs_new_inode(struct mnt_idmap *idmap,
 
 	if (f2fs_sb_has_extra_attr(sbi)) {
 		set_inode_flag(inode, FI_EXTRA_ATTR);
-		fi->i_extra_isize = F2FS_TOTAL_EXTRA_ATTR_SIZE;
+		fi->i_extra_isize = f2fs_new_extra_isize(dir);
 	}
 
 	if (test_opt(sbi, INLINE_XATTR))

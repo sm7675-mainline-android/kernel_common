@@ -406,6 +406,20 @@ static bool __f2fs_is_valid_blkaddr(struct f2fs_sb_info *sbi,
 	case DATA_GENERIC_ENHANCE:
 	case DATA_GENERIC_ENHANCE_READ:
 	case DATA_GENERIC_ENHANCE_UPDATE:
+#ifdef CONFIG_F2FS_OPLUS_INODE_LAYOUT
+		/*
+		 * OPLUS marks layered/dedup inodes with sentinel addresses.
+		 * They are not data blocks; report them explicitly instead of
+		 * letting the generic out-of-range path below do it, so the
+		 * failure is recognisable. Access still fails, never returns
+		 * a hole.
+		 */
+		if (unlikely(blkaddr == DEDUP_ADDR || blkaddr == SEQZONE_ADDR)) {
+			f2fs_err(sbi, "inode uses OPLUS-reserved blkaddr:%u (type:%d); dedup/seqzone not supported",
+				 blkaddr, type);
+			goto check_only;
+		}
+#endif
 		if (unlikely(blkaddr >= MAX_BLKADDR(sbi) ||
 				blkaddr < MAIN_BLKADDR(sbi))) {
 
