@@ -39,7 +39,7 @@ static int slim_device_match(struct device *dev, const struct device_driver *drv
 	if (of_driver_match_device(dev, drv))
 		return 1;
 
-	return !!slim_match(sbdrv->id_table, sbdev);
+	return sbdrv->id_table && slim_match(sbdrv->id_table, sbdev);
 }
 
 static void slim_device_update_status(struct slim_device *sbdev,
