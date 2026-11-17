@@ -127,6 +127,8 @@ struct rsc_drv {
 	struct notifier_block genpd_nb;
 	atomic_t cpus_in_pm;
 	struct tcs_group tcs[TCS_TYPE_NR];
+	struct tcs_group fast_tcs;
+	u32 fast_num_cmds;
 	DECLARE_BITMAP(tcs_in_use, MAX_TCS_NR);
 	spinlock_t lock;
 	wait_queue_head_t tcs_wait;
@@ -134,9 +136,20 @@ struct rsc_drv {
 	struct device *dev;
 	struct rsc_ver ver;
 	u32 *regs;
+	/*
+	 * Hardware channels accept sleep and wake requests without
+	 * borrowing a wake TCS for active-only transfers.
+	 */
+	bool hw_channel;
+	struct tcs_group hw_tcs[TCS_TYPE_NR];
+	unsigned int channel;
+	struct list_head hw_list;
 };
 
 int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg);
+int rpmh_rsc_init_fast_path(struct rsc_drv *drv, const struct tcs_request *msg);
+int rpmh_rsc_update_fast_path(struct rsc_drv *drv,
+			      const struct tcs_request *msg, u32 mask);
 int rpmh_rsc_write_ctrl_data(struct rsc_drv *drv,
 			     const struct tcs_request *msg);
 void rpmh_rsc_invalidate(struct rsc_drv *drv);

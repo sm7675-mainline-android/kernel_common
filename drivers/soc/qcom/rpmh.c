@@ -69,9 +69,23 @@ struct batch_cache_req {
 	struct rpmh_request rpm_msgs[];
 };
 
+/* Reject requests whose parent has no RSC controller. */
 static struct rpmh_ctrlr *get_rpmh_ctrlr(const struct device *dev)
 {
-	struct rsc_drv *drv = dev_get_drvdata(dev->parent);
+	struct rsc_drv *drv;
+
+	if (!dev || !dev->parent) {
+		pr_err_ratelimited("rpmh: %s has no parent device\n",
+		       dev ? dev_name(dev) : "<null dev>");
+		return NULL;
+	}
+
+	drv = dev_get_drvdata(dev->parent);
+	if (!drv) {
+		pr_err_ratelimited("rpmh: %s: parent %s has no RSC controller\n",
+		       dev_name(dev), dev_name(dev->parent));
+		return NULL;
+	}
 
 	return &drv->client;
 }
@@ -174,6 +188,9 @@ static int __rpmh_write(const struct device *dev, enum rpmh_state state,
 	int ret = -EINVAL;
 	struct cache_req *req;
 	int i;
+
+	if (!ctrlr)
+		return -ENODEV;
 
 	/* Cache the request in our store and link the payload */
 	for (i = 0; i < rpm_msg->msg.num_cmds; i++) {
@@ -334,6 +351,9 @@ int rpmh_write_batch(const struct device *dev, enum rpmh_state state,
 	if (!cmd || !n)
 		return -EINVAL;
 
+	if (!ctrlr)
+		return -ENODEV;
+
 	while (n[count] > 0)
 		count++;
 	if (!count)
@@ -352,7 +372,17 @@ int rpmh_write_batch(const struct device *dev, enum rpmh_state state,
 	rpm_msgs = req->rpm_msgs;
 
 	for (i = 0; i < count; i++) {
-		__fill_rpmh_msg(rpm_msgs + i, state, cmd, n[i]);
+		/*
+		 * Reject invalid batches before submitting an uninitialized
+		 * command array.
+		 */
+		ret = __fill_rpmh_msg(rpm_msgs + i, state, cmd, n[i]);
+		if (ret) {
+			pr_err_ratelimited("rpmh: batch fill failed at %d (n=%u count=%d)\n",
+			       i, n[i], count);
+			kfree(ptr);
+			return -EINVAL;
+		}
 		cmd += n[i];
 	}
 
@@ -441,7 +471,7 @@ int rpmh_flush(struct rpmh_ctrlr *ctrlr)
 	if (!spin_trylock(&ctrlr->cache_lock))
 		return -EBUSY;
 
-	if (!ctrlr->dirty) {
+	if (!ctrlr->dirty && !ctrlr_to_drv(ctrlr)->hw_channel) {
 		pr_debug("Skipping flush, TCS has latest data.\n");
 		goto write_next_wakeup;
 	}
@@ -473,7 +503,8 @@ int rpmh_flush(struct rpmh_ctrlr *ctrlr)
 	ctrlr->dirty = false;
 
 write_next_wakeup:
-	rpmh_rsc_write_next_wakeup(ctrlr_to_drv(ctrlr));
+	if (!ctrlr_to_drv(ctrlr)->hw_channel)
+		rpmh_rsc_write_next_wakeup(ctrlr_to_drv(ctrlr));
 exit:
 	spin_unlock(&ctrlr->cache_lock);
 	return ret;
@@ -500,3 +531,84 @@ void rpmh_invalidate(const struct device *dev)
 	spin_unlock_irqrestore(&ctrlr->cache_lock, flags);
 }
 EXPORT_SYMBOL_GPL(rpmh_invalidate);
+
+int rpmh_init_fast_path(const struct device *dev, struct tcs_cmd *cmd, int n)
+{
+	struct rpmh_ctrlr *ctrlr = get_rpmh_ctrlr(dev);
+	struct tcs_request req = {
+		.state = RPMH_ACTIVE_ONLY_STATE,
+		.cmds = cmd,
+		.num_cmds = n,
+	};
+
+	if (!ctrlr)
+		return -EPROBE_DEFER;
+	if (!cmd || n <= 0 || n > MAX_CMDS_PER_TCS)
+		return -EINVAL;
+	return rpmh_rsc_init_fast_path(ctrlr_to_drv(ctrlr), &req);
+}
+EXPORT_SYMBOL_GPL(rpmh_init_fast_path);
+
+int rpmh_update_fast_path(const struct device *dev, struct tcs_cmd *cmd,
+			  int n, u32 update_mask)
+{
+	struct rpmh_ctrlr *ctrlr = get_rpmh_ctrlr(dev);
+	struct tcs_request req = {
+		.state = RPMH_ACTIVE_ONLY_STATE,
+		.cmds = cmd,
+		.num_cmds = n,
+	};
+
+	if (!ctrlr)
+		return -ENODEV;
+	if (!cmd || n <= 0 || n > MAX_CMDS_PER_TCS)
+		return -EINVAL;
+	return rpmh_rsc_update_fast_path(ctrlr_to_drv(ctrlr), &req, update_mask);
+}
+EXPORT_SYMBOL_GPL(rpmh_update_fast_path);
+
+/*
+ * Downstream (Qualcomm/OnePlus) display RSC integration helpers.
+ *
+ * Upstream 6.18 has no notion of explicit TCS channel selection; the RSC
+ * hardware picks a channel itself. These two wrappers keep the downstream
+ * display driver (sde_rsc) building and behaving sensibly:
+ *
+ *  - rpmh_write_sleep_and_wake(): force a flush of the cached sleep/wake
+ *    sets so the controller can enter its low power state. rpmh_flush()
+ *    requires IRQs to be disabled, so do that around the call.
+ *  - rpmh_mode_solver_set(): on upstream the solver capability is detected
+ *    once at probe time and the CPU PM notifier is registered accordingly,
+ *    so there is no runtime state to toggle. Report success so the display
+ *    driver's state machine proceeds as it does downstream.
+ */
+int rpmh_write_sleep_and_wake(const struct device *dev)
+{
+	struct rpmh_ctrlr *ctrlr = get_rpmh_ctrlr(dev);
+	unsigned long flags;
+	int ret;
+
+	if (!ctrlr)
+		return -EINVAL;
+
+	local_irq_save(flags);
+	ret = rpmh_flush(ctrlr);
+	local_irq_restore(flags);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rpmh_write_sleep_and_wake);
+
+int rpmh_mode_solver_set(const struct device *dev, bool enable)
+{
+	struct rpmh_ctrlr *ctrlr = get_rpmh_ctrlr(dev);
+
+	if (!ctrlr)
+		return -EINVAL;
+
+	pr_debug("rpmh: solver mode %s (handled by RSC at probe)\n",
+		 enable ? "enable" : "disable");
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rpmh_mode_solver_set);
