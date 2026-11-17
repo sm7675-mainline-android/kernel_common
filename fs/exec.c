@@ -1825,6 +1825,13 @@ out:
 	return retval;
 }
 
+#ifdef CONFIG_KSU_MANUAL_HOOK
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+				void *argv, void *envp, int *flags);
+extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,
+				void *argv, void *envp, int *flags, int *retval);
+#endif
+
 static int do_execveat_common(int fd, struct filename *filename,
 			      struct user_arg_ptr argv,
 			      struct user_arg_ptr envp,
@@ -1832,6 +1839,10 @@ static int do_execveat_common(int fd, struct filename *filename,
 {
 	struct linux_binprm *bprm;
 	int retval;
+
+#ifdef CONFIG_KSU_MANUAL_HOOK
+	(void)ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+#endif
 
 	if (IS_ERR(filename))
 		return PTR_ERR(filename);
@@ -1906,6 +1917,10 @@ out_free:
 	free_bprm(bprm);
 
 out_ret:
+#ifdef CONFIG_KSU_MANUAL_HOOK
+	(void)ksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags,
+				       &retval);
+#endif
 	putname(filename);
 	return retval;
 }
