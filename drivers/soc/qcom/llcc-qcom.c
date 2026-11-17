@@ -54,6 +54,11 @@
 #define LLCC_TRP_ATTR0_CFGn(n)        (0x21000 + SZ_8 * n)
 #define LLCC_TRP_ATTR1_CFGn(n)        (0x21004 + SZ_8 * n)
 #define LLCC_TRP_ATTR2_CFGn(n)        (0x21100 + SZ_4 * n)
+#define LLCC_TRP_STAL_ATTR0_CFGn(n)   (0xc + SZ_4K * (n))
+#define LLCC_TRP_STAL_ATTR1_CFGn(n)   (0x10 + SZ_4K * (n))
+#define STALING_TRIGGER_MASK         BIT(0)
+#define STALING_ENABLE_MASK          BIT(0)
+#define STALING_NUM_FRAMES_MASK      GENMASK(6, 4)
 #define LLCC_V6_TRP_ATTR0_CFGn(n)     (cfg->reg_offset[LLCC_TRP_ATTR0_CFG] + SZ_64 * (n))
 #define LLCC_V6_TRP_ATTR1_CFGn(n)     (cfg->reg_offset[LLCC_TRP_ATTR1_CFG] + SZ_64 * (n))
 #define LLCC_V6_TRP_ATTR2_CFGn(n)     (cfg->reg_offset[LLCC_TRP_ATTR2_CFG] + SZ_64 * (n))
@@ -75,6 +80,7 @@
 #define LLCC_VERSION_2_0_0_0          0x02000000
 #define LLCC_VERSION_2_1_0_0          0x02010000
 #define LLCC_VERSION_4_1_0_0          0x04010000
+#define LLCC_VERSION_5_0_0_0          0x05000000
 #define LLCC_VERSION_6_0_0_0          0X06000000
 
 /**
@@ -3505,6 +3511,366 @@ static const u32 llcc_v6_reg_offset[] = {
 	[LLCC_TRP_WRS_CACHEABLE_EN]	= 0x00042088,
 };
 
+static const struct llcc_slice_config cliffs_data[] = {
+	{
+		.usecase_id = LLCC_CPUSS,
+		.slice_id = 1,
+		.max_cap = 3200,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.activate_on_init = 1,
+	},
+	{
+		.usecase_id = LLCC_VIDSC0,
+		.slice_id = 2,
+		.max_cap = 128,
+		.priority = 3,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_AUDIO,
+		.slice_id = 6,
+		.max_cap = 256,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_MDMHPGRW,
+		.slice_id = 25,
+		.max_cap = 1024,
+		.priority = 3,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_GPUHTW,
+		.slice_id = 11,
+		.max_cap = 256,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_GPU,
+		.slice_id = 9,
+		.max_cap = 3200,
+		.priority = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.write_scid_en = 1,
+		.write_scid_cacheable_en = 1,
+	},
+	{
+		.usecase_id = LLCC_MMUHWT,
+		.slice_id = 18,
+		.max_cap = 512,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.activate_on_init = 1,
+	},
+	{
+		.usecase_id = LLCC_DISP,
+		.slice_id = 16,
+		.max_cap = 3584,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.cache_mode = 2,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_MDMHPFX,
+		.slice_id = 24,
+		.max_cap = 1024,
+		.priority = 3,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_MDMPNG,
+		.slice_id = 27,
+		.max_cap = 256,
+		.priority = 3,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_MODPE,
+		.slice_id = 29,
+		.max_cap = 64,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3C00,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.alloc_oneway_en = 1,
+	},
+	{
+		.usecase_id = LLCC_WRCACHE,
+		.slice_id = 31,
+		.max_cap = 512,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.activate_on_init = 1,
+	},
+	{
+		.usecase_id = LLCC_CAMEXP0,
+		.slice_id = 4,
+		.max_cap = 256,
+		.priority = 3,
+		.fixed_size = 1,
+		.bonus_ways = 0xF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_CAMEXP1,
+		.slice_id = 7,
+		.max_cap = 1536,
+		.priority = 2,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FF0,
+		.res_ways = 0x0,
+		.cache_mode = 2,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_LCPDARE,
+		.slice_id = 30,
+		.max_cap = 128,
+		.priority = 3,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.activate_on_init = 1,
+		.alloc_oneway_en = 1,
+	},
+	{
+		.usecase_id = LLCC_AENPU,
+		.slice_id = 3,
+		.max_cap = 2048,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.cache_mode = 2,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_ISLAND1,
+		.slice_id = 12,
+		.max_cap = 3328,
+		.priority = 7,
+		.fixed_size = 1,
+		.bonus_ways = 0x0,
+		.res_ways = 0x1FFF,
+		.probe_target_ways = 0x0,
+	},
+};
+
+static const struct llcc_slice_config cliffs7_data[] = {
+	{
+		.usecase_id = LLCC_CPUSS,
+		.slice_id = 1,
+		.max_cap = 3200,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.activate_on_init = 1,
+	},
+	{
+		.usecase_id = LLCC_VIDSC0,
+		.slice_id = 2,
+		.max_cap = 128,
+		.priority = 3,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_AUDIO,
+		.slice_id = 6,
+		.max_cap = 256,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_MDMHPGRW,
+		.slice_id = 25,
+		.max_cap = 1024,
+		.priority = 3,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_GPUHTW,
+		.slice_id = 11,
+		.max_cap = 256,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_GPU,
+		.slice_id = 9,
+		.max_cap = 3200,
+		.priority = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.write_scid_en = 1,
+		.write_scid_cacheable_en = 1,
+	},
+	{
+		.usecase_id = LLCC_MMUHWT,
+		.slice_id = 18,
+		.max_cap = 512,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.activate_on_init = 1,
+	},
+	{
+		.usecase_id = LLCC_DISP,
+		.slice_id = 16,
+		.max_cap = 3584,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.cache_mode = 2,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_MDMHPFX,
+		.slice_id = 24,
+		.max_cap = 1024,
+		.priority = 3,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_MDMPNG,
+		.slice_id = 27,
+		.max_cap = 256,
+		.priority = 3,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_MODPE,
+		.slice_id = 29,
+		.max_cap = 64,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3C00,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.alloc_oneway_en = 1,
+	},
+	{
+		.usecase_id = LLCC_WRCACHE,
+		.slice_id = 31,
+		.max_cap = 512,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.activate_on_init = 1,
+	},
+	{
+		.usecase_id = LLCC_CAMEXP0,
+		.slice_id = 4,
+		.max_cap = 256,
+		.priority = 3,
+		.fixed_size = 1,
+		.bonus_ways = 0xF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_CAMEXP1,
+		.slice_id = 7,
+		.max_cap = 1536,
+		.priority = 2,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FF0,
+		.res_ways = 0x0,
+		.cache_mode = 2,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_LCPDARE,
+		.slice_id = 30,
+		.max_cap = 128,
+		.priority = 3,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.probe_target_ways = 0x0,
+		.activate_on_init = 1,
+		.alloc_oneway_en = 1,
+	},
+	{
+		.usecase_id = LLCC_AENPU,
+		.slice_id = 3,
+		.max_cap = 2048,
+		.priority = 1,
+		.fixed_size = 1,
+		.bonus_ways = 0x3FFF,
+		.res_ways = 0x0,
+		.cache_mode = 2,
+		.probe_target_ways = 0x0,
+	},
+	{
+		.usecase_id = LLCC_ISLAND1,
+		.slice_id = 12,
+		.max_cap = 2048,
+		.priority = 7,
+		.fixed_size = 1,
+		.bonus_ways = 0x0,
+		.res_ways = 0xFF,
+		.probe_target_ways = 0x0,
+	},
+};
+
 static const struct qcom_llcc_config qcs615_cfg[] = {
 	{
 		.sct_data	= qcs615_data,
@@ -3731,6 +4097,24 @@ static const struct qcom_llcc_config x1e80100_cfg[] = {
 	},
 };
 
+static const struct qcom_llcc_config cliffs_cfg[] = {
+	{
+		.sct_data	= cliffs_data,
+		.size		= ARRAY_SIZE(cliffs_data),
+		.reg_offset	= llcc_v2_1_reg_offset,
+		.edac_reg_offset = &llcc_v2_1_edac_reg_offset,
+	},
+};
+
+static const struct qcom_llcc_config cliffs7_cfg[] = {
+	{
+		.sct_data	= cliffs7_data,
+		.size		= ARRAY_SIZE(cliffs7_data),
+		.reg_offset	= llcc_v2_1_reg_offset,
+		.edac_reg_offset = &llcc_v2_1_edac_reg_offset,
+	},
+};
+
 static const struct qcom_sct_config qcs615_cfgs = {
 	.llcc_config	= qcs615_cfg,
 	.num_config	= ARRAY_SIZE(qcs615_cfg),
@@ -3824,6 +4208,16 @@ static const struct qcom_sct_config sm8450_cfgs = {
 static const struct qcom_sct_config sm8550_cfgs = {
 	.llcc_config	= sm8550_cfg,
 	.num_config	= ARRAY_SIZE(sm8550_cfg),
+};
+
+static const struct qcom_sct_config cliffs_cfgs = {
+	.llcc_config	= cliffs_cfg,
+	.num_config	= ARRAY_SIZE(cliffs_cfg),
+};
+
+static const struct qcom_sct_config cliffs7_cfgs = {
+	.llcc_config	= cliffs7_cfg,
+	.num_config	= ARRAY_SIZE(cliffs7_cfg),
 };
 
 static const struct qcom_sct_config sm8650_cfgs = {
@@ -4048,6 +4442,78 @@ size_t llcc_get_slice_size(struct llcc_slice_desc *desc)
 	return desc->slice_size;
 }
 EXPORT_SYMBOL_GPL(llcc_get_slice_size);
+
+bool llcc_is_notif_staling_supported(void)
+{
+	return !IS_ERR(drv_data) &&
+		drv_data->version >= LLCC_VERSION_5_0_0_0 &&
+		drv_data->version < LLCC_VERSION_6_0_0_0;
+}
+EXPORT_SYMBOL_GPL(llcc_is_notif_staling_supported);
+
+int llcc_configure_staling_mode(struct llcc_slice_desc *desc,
+			       struct llcc_staling_mode_params *params)
+{
+	u32 mask = STALING_ENABLE_MASK;
+	u32 value = 0;
+	int ret;
+
+	if (IS_ERR(drv_data))
+		return PTR_ERR(drv_data);
+	if (!llcc_is_notif_staling_supported())
+		return -EOPNOTSUPP;
+	if (IS_ERR_OR_NULL(desc) || !params ||
+	    desc->slice_id > drv_data->max_slices)
+		return -EINVAL;
+
+	switch (params->staling_mode) {
+	case LLCC_STALING_MODE_CAPACITY:
+		break;
+	case LLCC_STALING_MODE_NOTIFY:
+		if (params->notify_params.op != LLCC_NOTIFY_STALING_WRITEBACK ||
+		    params->notify_params.staling_distance >
+		    FIELD_MAX(STALING_NUM_FRAMES_MASK))
+			return -EINVAL;
+		mask |= STALING_NUM_FRAMES_MASK;
+		value = STALING_ENABLE_MASK |
+			FIELD_PREP(STALING_NUM_FRAMES_MASK,
+				   params->notify_params.staling_distance);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	mutex_lock(&drv_data->lock);
+	ret = regmap_update_bits(drv_data->bcast_regmap,
+				 LLCC_TRP_STAL_ATTR1_CFGn(desc->slice_id),
+				 mask, value);
+	mutex_unlock(&drv_data->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(llcc_configure_staling_mode);
+
+int llcc_notif_staling_inc_counter(struct llcc_slice_desc *desc)
+{
+	u32 reg, discard;
+	int ret;
+
+	if (IS_ERR(drv_data))
+		return PTR_ERR(drv_data);
+	if (!llcc_is_notif_staling_supported())
+		return -EOPNOTSUPP;
+	if (IS_ERR_OR_NULL(desc) || desc->slice_id > drv_data->max_slices)
+		return -EINVAL;
+
+	reg = LLCC_TRP_STAL_ATTR0_CFGn(desc->slice_id);
+	mutex_lock(&drv_data->lock);
+	ret = regmap_write_bits(drv_data->bcast_regmap, reg,
+			       STALING_TRIGGER_MASK, STALING_TRIGGER_MASK);
+	if (!ret)
+		ret = regmap_read(drv_data->bcast_regmap, reg, &discard);
+	mutex_unlock(&drv_data->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(llcc_notif_staling_inc_counter);
 
 static int _qcom_llcc_cfg_program(const struct llcc_slice_config *config,
 				  const struct qcom_llcc_config *cfg)
@@ -4360,7 +4826,8 @@ static int qcom_llcc_cfg_program(struct platform_device *pdev,
 	sz = drv_data->cfg_size;
 	llcc_table = drv_data->cfg;
 
-	if (drv_data->version >= LLCC_VERSION_6_0_0_0) {
+	if (drv_data->version >= LLCC_VERSION_6_0_0_0 &&
+	    cfg->reg_offset == llcc_v6_reg_offset) {
 		for (i = 0; i < sz; i++) {
 			ret = _qcom_llcc_cfg_program_v6(&llcc_table[i], cfg);
 			if (ret)
@@ -4405,13 +4872,32 @@ static struct regmap *qcom_llcc_init_mmio(struct platform_device *pdev, u8 index
 					  const char *name)
 {
 	void __iomem *base;
+	struct resource bank, *res;
 	struct regmap_config llcc_regmap_config = {
 		.reg_bits = 32,
 		.reg_stride = 4,
 		.val_bits = 32,
 	};
 
-	base = devm_platform_ioremap_resource(pdev, index);
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "llcc_base");
+	if (res && of_device_is_compatible(pdev->dev.of_node, "qcom,llcc-v50")) {
+		if (!strcmp(name, "llcc_broadcast_base") ||
+		    !strcmp(name, "llcc_broadcast_and_base")) {
+			res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
+			if (!res)
+				return ERR_PTR(-EINVAL);
+		} else {
+			if ((resource_size_t)(index + 1) * SZ_2M > resource_size(res))
+				return ERR_PTR(-EINVAL);
+			bank = *res;
+			bank.start += (resource_size_t)index * SZ_2M;
+			bank.end = bank.start + SZ_2M - 1;
+			res = &bank;
+		}
+		base = devm_ioremap_resource(&pdev->dev, res);
+	} else {
+		base = devm_platform_ioremap_resource(pdev, index);
+	}
 	if (IS_ERR(base))
 		return ERR_CAST(base);
 
@@ -4562,8 +5048,11 @@ static int qcom_llcc_probe(struct platform_device *pdev)
 			dev_err(dev, "Failed to register llcc edac driver\n");
 	}
 
+	dev_dbg(dev, "LLCC ready banks=%u version=%#x slices=%u\n",
+		 num_banks, version, sz);
 	return 0;
 err:
+	dev_err(dev, "LLCC probe failed: %d\n", ret);
 	drv_data = ERR_PTR(-ENODEV);
 	return ret;
 }
@@ -4588,6 +5077,8 @@ static const struct of_device_id qcom_llcc_of_match[] = {
 	{ .compatible = "qcom,sm8350-llcc", .data = &sm8350_cfgs },
 	{ .compatible = "qcom,sm8450-llcc", .data = &sm8450_cfgs },
 	{ .compatible = "qcom,sm8550-llcc", .data = &sm8550_cfgs },
+	{ .compatible = "qcom,cliffs-llcc", .data = &cliffs_cfgs },
+	{ .compatible = "qcom,cliffs7-llcc", .data = &cliffs7_cfgs },
 	{ .compatible = "qcom,sm8650-llcc", .data = &sm8650_cfgs },
 	{ .compatible = "qcom,sm8750-llcc", .data = &sm8750_cfgs },
 	{ .compatible = "qcom,x1e80100-llcc", .data = &x1e80100_cfgs },
