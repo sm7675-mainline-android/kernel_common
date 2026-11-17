@@ -77,10 +77,7 @@ struct qrtr_node {
  */
 #define QRTR_NS_MAX_SERVERS 256
 
-/* Max lookup limit is chosen based on the current platform requirements. If the
- * requirement changes in the future, this value can be increased.
- */
-#define QRTR_NS_MAX_LOOKUPS 64
+#define QRTR_NS_MAX_LOOKUPS 1024
 
 /* Max nodes limit is chosen based on the current platform requirements.
  * If the requirement changes in the future, this value can be increased.
@@ -216,7 +213,10 @@ static void lookup_notify(struct sockaddr_qrtr *to, struct qrtr_server *srv,
 
 	ret = kernel_sendmsg(qrtr_ns.sock, &msg, &iv, 1, sizeof(pkt));
 	if (ret < 0 && ret != -ENODEV)
-		pr_err("failed to send lookup notification\n");
+		pr_err_ratelimited("QRTR lookup notification failed client=%u:%u service=%u instance=%u end=%u rc=%d\n",
+				   to->sq_node, to->sq_port,
+				   srv ? srv->service : 0,
+				   srv ? srv->instance : 0, !srv, ret);
 }
 
 static int announce_servers(struct sockaddr_qrtr *sq)
@@ -584,7 +584,9 @@ static int ctrl_cmd_new_lookup(struct sockaddr_qrtr *from,
 		return -EINVAL;
 
 	if (qrtr_ns.lookup_count >= QRTR_NS_MAX_LOOKUPS) {
-		pr_err_ratelimited("QRTR client node exceeds max lookup limit!\n");
+		pr_err_ratelimited("QRTR lookup limit count=%u limit=%u client=%u:%u service=%u instance=%u\n",
+				   qrtr_ns.lookup_count, QRTR_NS_MAX_LOOKUPS,
+				   from->sq_node, from->sq_port, service, instance);
 		return -ENOSPC;
 	}
 
@@ -613,6 +615,12 @@ static int ctrl_cmd_new_lookup(struct sockaddr_qrtr *from,
 
 	/* Empty notification, to indicate end of listing */
 	lookup_notify(from, NULL, true);
+
+	if (qrtr_ns.lookup_count >= 64 &&
+	    !(qrtr_ns.lookup_count & (qrtr_ns.lookup_count - 1)))
+		pr_info("QRTR lookup capacity count=%u limit=%u client=%u:%u service=%u instance=%u\n",
+			qrtr_ns.lookup_count, QRTR_NS_MAX_LOOKUPS,
+			from->sq_node, from->sq_port, service, instance);
 
 	return 0;
 }

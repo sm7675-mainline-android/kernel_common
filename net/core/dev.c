@@ -11418,12 +11418,13 @@ EXPORT_SYMBOL(register_netdevice);
  * The setup steps dummy netdevs need which normal netdevs get by going
  * through register_netdevice().
  */
-static void init_dummy_netdev(struct net_device *dev)
+int init_dummy_netdev(struct net_device *dev)
 {
 	/* make sure we BUG if trying to hit standard
 	 * register/unregister code path
 	 */
 	dev->reg_state = NETREG_DUMMY;
+	INIT_LIST_HEAD(&dev->napi_list);
 
 	/* a dummy interface is started by default */
 	set_bit(__LINK_STATE_PRESENT, &dev->state);
@@ -11433,7 +11434,9 @@ static void init_dummy_netdev(struct net_device *dev)
 	 * because users of this 'device' dont need to change
 	 * its refcount.
 	 */
+	return 0;
 }
+EXPORT_SYMBOL_GPL(init_dummy_netdev);
 
 /**
  *	register_netdev	- register a network device
@@ -12140,6 +12143,11 @@ void free_netdev(struct net_device *dev)
 }
 EXPORT_SYMBOL(free_netdev);
 
+static void init_dummy_netdev_setup(struct net_device *dev)
+{
+	init_dummy_netdev(dev);
+}
+
 /**
  * alloc_netdev_dummy - Allocate and initialize a dummy net device.
  * @sizeof_priv: size of private data to allocate space for
@@ -12149,7 +12157,7 @@ EXPORT_SYMBOL(free_netdev);
 struct net_device *alloc_netdev_dummy(int sizeof_priv)
 {
 	return alloc_netdev(sizeof_priv, "dummy#", NET_NAME_UNKNOWN,
-			    init_dummy_netdev);
+			    init_dummy_netdev_setup);
 }
 EXPORT_SYMBOL_GPL(alloc_netdev_dummy);
 

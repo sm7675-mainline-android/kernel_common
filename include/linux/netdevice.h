@@ -4965,6 +4965,7 @@ void ether_setup(struct net_device *dev);
 
 /* Allocate dummy net_device */
 struct net_device *alloc_netdev_dummy(int sizeof_priv);
+int init_dummy_netdev(struct net_device *dev);
 
 /* Support for loadable net-drivers */
 struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
