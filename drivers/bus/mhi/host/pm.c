@@ -780,6 +780,19 @@ int mhi_queue_state_transition(struct mhi_controller *mhi_cntrl,
 	return 0;
 }
 
+/* KPORT_VENDOR_MHI_REPORT_ERROR: vendor cnss2 forces the link into SYS_ERR on
+ * a fatal firmware condition.  Route it through the upstream transition worker
+ * instead of the pre-6.18 vendor private bookkeeping. */
+int mhi_report_error(struct mhi_controller *mhi_cntrl)
+{
+	if (!mhi_cntrl)
+		return -EINVAL;
+
+	mhi_queue_state_transition(mhi_cntrl, DEV_ST_TRANSITION_SYS_ERR);
+	return 0;
+}
+EXPORT_SYMBOL(mhi_report_error);
+
 /* SYS_ERR worker */
 void mhi_pm_sys_err_handler(struct mhi_controller *mhi_cntrl)
 {
@@ -1319,6 +1332,21 @@ int mhi_force_rddm_mode(struct mhi_controller *mhi_cntrl)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mhi_force_rddm_mode);
+
+/* KPORT_VENDOR_MHI_DEVICE_GET: async variant used by vendor wlan/ipa
+ * clients before 6.18.  Same effect as get_sync() minus the wait. */
+void mhi_device_get(struct mhi_device *mhi_dev)
+{
+	struct mhi_controller *mhi_cntrl = mhi_dev->mhi_cntrl;
+
+	mhi_dev->dev_wake++;
+	read_lock_bh(&mhi_cntrl->pm_lock);
+	if (MHI_PM_IN_SUSPEND_STATE(mhi_cntrl->pm_state))
+		mhi_trigger_resume(mhi_cntrl);
+	mhi_cntrl->wake_get(mhi_cntrl, true);
+	read_unlock_bh(&mhi_cntrl->pm_lock);
+}
+EXPORT_SYMBOL_GPL(mhi_device_get);
 
 int mhi_device_get_sync(struct mhi_device *mhi_dev)
 {

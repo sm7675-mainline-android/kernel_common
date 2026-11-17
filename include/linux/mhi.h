@@ -45,6 +45,7 @@ enum mhi_callback {
 	MHI_CB_SYS_ERROR,
 	MHI_CB_FATAL_ERROR,
 	MHI_CB_BW_REQ,
+	MHI_CB_FALLBACK_IMG,
 };
 
 /**
@@ -106,6 +107,7 @@ struct image_info {
 struct mhi_link_info {
 	unsigned int target_link_speed;
 	unsigned int target_link_width;
+	u32 sequence_num;
 };
 
 /**
@@ -187,6 +189,14 @@ enum mhi_ch_ee_mask {
 enum mhi_er_data_type {
 	MHI_ER_DATA,
 	MHI_ER_CTRL,
+	MHI_ER_BW_SCALE,
+	MHI_ER_TIMESYNC,
+};
+
+enum mhi_er_priority {
+	MHI_ER_PRIORITY_DEFAULT_NOSLEEP,
+	MHI_ER_PRIORITY_HI_NOSLEEP,
+	MHI_ER_PRIORITY_HI_SLEEP,
 };
 
 /**
@@ -286,6 +296,7 @@ struct mhi_controller_config {
 	struct mhi_event_config *event_cfg;
 	bool use_bounce_buf;
 	bool m2_no_db;
+	u32 bhie_offset;
 };
 
 /**
@@ -376,10 +387,12 @@ struct mhi_controller {
 	void __iomem *bhi;
 	void __iomem *bhie;
 	void __iomem *wake_db;
+	void __iomem *host_notify_db;
 
 	dma_addr_t iova_start;
 	dma_addr_t iova_stop;
 	const char *fw_image;
+	const char *fallback_fw_image;
 	const u8 *fw_data;
 	size_t fw_sz;
 	const char *edl_image;
@@ -398,6 +411,16 @@ struct mhi_controller {
 	u32 sw_ev_rings;
 	u32 nr_irqs;
 	u32 serial_number;
+	u32 oem_pk_hash[MHI_MAX_OEM_PK_HASH_SEGMENTS];
+	u32 session_id;
+
+	/* KPORT_VENDOR_MHI_FIELDS: vendor cnss2 reads the SoC HW version that
+	 * it programs into these fields and forwards it to the firmware. */
+	u32 family_number;
+	u32 device_number;
+	u32 major_version;
+	u32 minor_version;
+	bool tme_supported_image;
 
 	struct mhi_event *mhi_event;
 	struct mhi_cmd *mhi_cmd;
@@ -413,7 +436,7 @@ struct mhi_controller {
 	enum mhi_state dev_state;
 	atomic_t dev_wake;
 	atomic_t pending_pkts;
-	u32 M0, M2, M3;
+	u32 M0, M2, M3, M3_fast;
 	struct list_head transition_list;
 	spinlock_t transition_lock;
 	spinlock_t wlock;
@@ -429,6 +452,7 @@ struct mhi_controller {
 	void (*wake_toggle)(struct mhi_controller *mhi_cntrl);
 	int (*runtime_get)(struct mhi_controller *mhi_cntrl);
 	void (*runtime_put)(struct mhi_controller *mhi_cntrl);
+	void (*runtime_last_busy)(struct mhi_controller *mhi_cntrl);
 	int (*map_single)(struct mhi_controller *mhi_cntrl,
 			  struct mhi_buf_info *buf);
 	void (*unmap_single)(struct mhi_controller *mhi_cntrl,
@@ -442,6 +466,7 @@ struct mhi_controller {
 
 	size_t buffer_len;
 	int index;
+	bool img_pre_alloc;
 	bool bounce_buf;
 	bool fbc_download;
 	bool wake_set;
@@ -472,8 +497,12 @@ struct mhi_device {
 	struct device dev;
 	enum mhi_device_type dev_type;
 	int ul_chan_id;
+	int ul_event_id;
 	int dl_chan_id;
+	int dl_event_id;
 	u32 dev_wake;
+	/* OnePlus/Qualcomm vendor extension: last TIOCM state for DTR/RTS. */
+	u32 tiocm;
 };
 
 /**
@@ -720,11 +749,16 @@ enum mhi_state mhi_get_mhi_state(struct mhi_controller *mhi_cntrl);
  */
 void mhi_soc_reset(struct mhi_controller *mhi_cntrl);
 
+int mhi_report_error(struct mhi_controller *mhi_cntrl);
+
 /**
  * mhi_device_get_sync - Disable device low power mode. Synchronously
  *                       take the controller out of suspended state
  * @mhi_dev: Device associated with the channel
  */
+/* KPORT_VENDOR_MHI_DEVICE_GET: pre-6.18 async wake grab, still used by
+ * vendor wlan/ipa clients. */
+void mhi_device_get(struct mhi_device *mhi_dev);
 int mhi_device_get_sync(struct mhi_device *mhi_dev);
 
 /**
