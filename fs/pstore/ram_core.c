@@ -507,11 +507,29 @@ static int persistent_ram_buffer_map(phys_addr_t start, phys_addr_t size,
 	prz->paddr = start;
 	prz->size = size;
 
-	if (pfn_valid(start >> PAGE_SHIFT))
+	if (pfn_valid(start >> PAGE_SHIFT)) {
+		/*
+		 * PORT-6.18: a region that is still owned by the page allocator
+		 * must never be used for pstore.  persistent_ram_vmap() maps the
+		 * physical pages a second time, so any allocation that later
+		 * lands on them is silently corrupted by every printk.
+		 *
+		 * This is not hypothetical: the stock Cliffs DTB describes
+		 * ramoops without a "reg" property, so the cmdline
+		 * ramoops.mem_address=0x86000000 window was never reserved and
+		 * the kernel scribbled over its own allocations.
+		 */
+		if (!PageReserved(pfn_to_page(start >> PAGE_SHIFT))) {
+			pr_err("ramoops: 0x%llx+0x%llx is NOT reserved, refusing to use it\n",
+			       (unsigned long long)start,
+			       (unsigned long long)size);
+			return -EBUSY;
+		}
 		prz->vaddr = persistent_ram_vmap(start, size, memtype);
-	else
+	} else {
 		prz->vaddr = persistent_ram_iomap(start, size, memtype,
 						  prz->label);
+	}
 
 	if (!prz->vaddr) {
 		pr_err("%s: Failed to map 0x%llx pages at 0x%llx\n", __func__,
