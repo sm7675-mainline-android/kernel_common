@@ -1105,6 +1105,10 @@ int kasan_brk_handler(struct pt_regs *regs, unsigned long esr)
 #ifdef CONFIG_UBSAN_TRAP
 int ubsan_brk_handler(struct pt_regs *regs, unsigned long esr)
 {
+	pr_emerg("UBSAN trap: %s pc=%pS lr=%pS esr=%#lx cpu=%u comm=%s/%d\n",
+		 report_ubsan_failure(esr & UBSAN_BRK_MASK),
+		 (void *)regs->pc, (void *)regs->regs[30], esr,
+		 raw_smp_processor_id(), current->comm, current->pid);
 	die(report_ubsan_failure(esr & UBSAN_BRK_MASK), regs, esr);
 	return DBG_HOOK_HANDLED;
 }

@@ -41,6 +41,7 @@
 #include <linux/start_kernel.h>
 #include <linux/security.h>
 #include <linux/smp.h>
+#include <linux/splashlog.h>
 #include <linux/profile.h>
 #include <linux/kfence.h>
 #include <linux/rcupdate.h>
@@ -1627,6 +1628,8 @@ static int __ref kernel_init(void *unused)
 	rcu_end_inkernel_boot();
 
 	do_sysctl_args();
+
+	splashlog_before_init();
 
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);

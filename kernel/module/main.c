@@ -37,6 +37,7 @@
 #include <linux/sched.h>
 #include <linux/device.h>
 #include <linux/string.h>
+#include <linux/splashlog.h>
 #include <linux/mutex.h>
 #include <linux/rculist.h>
 #include <linux/uaccess.h>
@@ -3054,6 +3055,7 @@ module_param(async_probe, bool, 0644);
 static noinline int do_init_module(struct module *mod)
 {
 	int ret = 0;
+	bool track_modules = splashlog_modules_enabled();
 	struct mod_initfree *freeinit;
 #if defined(CONFIG_MODULE_STATS)
 	unsigned int text_size = 0, total_size = 0;
@@ -3079,8 +3081,15 @@ static noinline int do_init_module(struct module *mod)
 
 	do_mod_ctors(mod);
 	/* Start the module */
-	if (mod->init != NULL)
+	if (mod->init != NULL) {
+		if (track_modules) {
+			splashlog_modtrace(mod->name);
+			splashlog_modphase(mod->name, SL_MODULE_INIT);
+		}
 		ret = do_one_initcall(mod->init);
+		if (track_modules)
+			splashlog_modphase(mod->name, SL_MODULE_INIT_DONE);
+	}
 	if (ret < 0) {
 		goto fail_free_freeinit;
 	}
@@ -3108,8 +3117,13 @@ static noinline int do_init_module(struct module *mod)
 	 * See commit 0fdff3ec6d87 ("async, kmod: warn on synchronous
 	 * request_module() from async workers") for more details.
 	 */
-	if (!mod->async_probe_requested)
+	if (!mod->async_probe_requested) {
+		if (track_modules)
+			splashlog_modphase(mod->name, SL_MODULE_ASYNC);
 		async_synchronize_full();
+	}
+	if (track_modules)
+		splashlog_modphase(mod->name, SL_MODULE_FINISH);
 
 	ftrace_free_mem(mod, mod->mem[MOD_INIT_TEXT].base,
 			mod->mem[MOD_INIT_TEXT].base + mod->mem[MOD_INIT_TEXT].size);
@@ -3552,7 +3566,18 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	/* Done! */
 	trace_module_load(mod);
 
-	return do_init_module(mod);
+	{
+		char mname[MODULE_NAME_LEN];
+		bool track_modules = splashlog_modules_enabled();
+
+		/* do_init_module() may free mod before returning an error. */
+		if (track_modules)
+			strscpy(mname, mod->name, sizeof(mname));
+		err = do_init_module(mod);
+		if (track_modules && err)
+			splashlog_modfail(mname, err);
+	}
+	return err;
 
  sysfs_cleanup:
 	mod_sysfs_teardown(mod);
@@ -3602,6 +3627,15 @@ static int load_module(struct load_info *info, const char __user *uargs,
 		audit_log_kern_module(info->name ? info->name : "?");
 		mod_stat_bump_becoming(info, flags);
 	}
+	if (splashlog_modules_enabled()) {
+		char mname[MODULE_NAME_LEN];
+
+		if (info->name)
+			strscpy(mname, info->name, sizeof(mname));
+		else
+			strscpy(mname, "?", sizeof(mname));
+		splashlog_modfail(mname, err);
+	}
 	free_copy(info, flags);
 	return err;
 }
@@ -3626,7 +3660,13 @@ SYSCALL_DEFINE3(init_module, void __user *, umod,
 		return err;
 	}
 
-	return load_module(&info, uargs, 0);
+	if (!splashlog_modules_enabled())
+		return load_module(&info, uargs, 0);
+
+	splashlog_modphase("<init_module>", SL_MODULE_FILE);
+	err = load_module(&info, uargs, 0);
+	splashlog_modphase("<init_module>", SL_MODULE_END);
+	return err;
 }
 
 struct idempotent {
@@ -3776,7 +3816,31 @@ SYSCALL_DEFINE3(finit_module, int, fd, const char __user *, uargs, int, flags)
 	CLASS(fd, f)(fd);
 	if (fd_empty(f))
 		return -EBADF;
-	return idempotent_init_module(fd_file(f), uargs, flags);
+	if (!splashlog_modules_enabled())
+		return idempotent_init_module(fd_file(f), uargs, flags);
+
+	{
+		struct file *mf = fd_file(f);
+		char *pbuf;
+		const char *path, *name;
+		int ret;
+
+		name = (const char *)mf->f_path.dentry->d_name.name;
+		splashlog_modphase(name, SL_MODULE_FILE);
+		ret = idempotent_init_module(mf, uargs, flags);
+		splashlog_modphase(name, SL_MODULE_END);
+		/* Keep the path to distinguish modules with the same basename. */
+		name = (const char *)mf->f_path.dentry->d_name.name;
+		pbuf = kmalloc(160, GFP_KERNEL);
+		if (pbuf) {
+			path = d_path(&mf->f_path, pbuf, 160);
+			splashlog_modattempt(IS_ERR(path) ? name : path, ret);
+			kfree(pbuf);
+		} else {
+			splashlog_modattempt(name, ret);
+		}
+		return ret;
+	}
 }
 
 /* Keep in sync with MODULE_FLAGS_BUF_SIZE !!! */

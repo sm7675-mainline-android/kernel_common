@@ -26,6 +26,7 @@
 #include <linux/panic_notifier.h>
 #include <linux/sched.h>
 #include <linux/string_helpers.h>
+#include <linux/splashlog.h>
 #include <linux/sysrq.h>
 #include <linux/init.h>
 #include <linux/nmi.h>
@@ -889,6 +890,8 @@ void __warn(const char *file, int line, void *caller, unsigned taint,
 	if (args)
 		vprintk(args->fmt, args->args);
 #pragma GCC diagnostic pop
+
+	splashlog_warn(file, line, caller);
 
 	print_modules();
 

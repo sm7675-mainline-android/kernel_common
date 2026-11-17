@@ -22,6 +22,7 @@
 #include <linux/cpu.h>
 #include <linux/interrupt.h>
 #include <linux/smp.h>
+#include <linux/splashlog.h>
 #include <linux/fs.h>
 #include <linux/panic_notifier.h>
 #include <linux/proc_fs.h>
@@ -338,6 +339,9 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	/* Parse the ACPI tables for possible boot-time configuration */
 	acpi_boot_table_init();
+
+	/* The linear map is available after paging_init(). */
+	splashlog_early_init();
 
 	if (acpi_disabled)
 		unflatten_device_tree();
