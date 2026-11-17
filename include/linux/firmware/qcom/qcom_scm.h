@@ -72,8 +72,8 @@ struct qcom_scm_pas_metadata {
 	ssize_t size;
 };
 
-int qcom_scm_pas_init_image(u32 peripheral, const void *metadata, size_t size,
-			    struct qcom_scm_pas_metadata *ctx);
+int qcom_scm_pas_init_image_ex(u32 peripheral, const void *metadata, size_t size,
+			       struct qcom_scm_pas_metadata *ctx);
 void qcom_scm_pas_metadata_release(struct qcom_scm_pas_metadata *ctx);
 int qcom_scm_pas_mem_setup(u32 peripheral, phys_addr_t addr, phys_addr_t size);
 int qcom_scm_pas_auth_and_reset(u32 peripheral);
@@ -105,6 +105,14 @@ bool qcom_scm_ice_available(void);
 int qcom_scm_ice_invalidate_key(u32 index);
 int qcom_scm_ice_set_key(u32 index, const u8 *key, u32 key_size,
 			 enum qcom_scm_ice_cipher cipher, u32 data_unit_size);
+/*
+ * Vendor ICE V2 key programming and clearing interfaces with a CE
+ * identifier.
+ */
+int qcom_scm_ice_set_key_ce(u32 index, const u8 *key, u32 key_size,
+			    enum qcom_scm_ice_cipher cipher,
+			    u32 data_unit_size, u32 ce);
+int qcom_scm_ice_invalidate_key_ce(u32 index, u32 ce);
 bool qcom_scm_has_wrapped_key_support(void);
 int qcom_scm_derive_sw_secret(const u8 *eph_key, size_t eph_key_size,
 			      u8 *sw_secret, size_t sw_secret_size);
@@ -181,4 +189,69 @@ int qcom_scm_qtee_invoke_smc(phys_addr_t inbuf, size_t inbuf_size,
 int qcom_scm_qtee_callback_response(phys_addr_t buf, size_t buf_size,
 				    u64 *result, u64 *response_type);
 
+
+/* Vendor SCM interfaces. */
+int qcom_scm_mem_protect_sd_ctrl(u32 devid, phys_addr_t mem_addr,
+				 phys_addr_t mem_size, u32 vmid);
+int qcom_scm_pas_shutdown_retry(u32 peripheral);
+int qcom_scm_io_reset(void);
+bool qcom_scm_kgsl_set_smmu_aperture_available(void);
+int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank);
+int qcom_scm_kgsl_set_smmu_lpac_aperture(unsigned int num_context_bank);
+int qcom_scm_kgsl_init_regs(u32 gpu_req);
+bool qcom_scm_dcvs_core_available(void);
+bool qcom_scm_dcvs_ca_available(void);
+int qcom_scm_dcvs_reset(void);
+int qcom_scm_dcvs_init_v2(phys_addr_t addr, size_t size, int *version);
+int qcom_scm_dcvs_init_ca_v2(phys_addr_t addr, size_t size);
+int qcom_scm_dcvs_update(int level, s64 total_time, s64 busy_time);
+int qcom_scm_dcvs_update_v2(int level, s64 total_time, s64 busy_time);
+int qcom_scm_dcvs_update_ca_v2(int level, s64 total_time, s64 busy_time,
+			       int context_count);
+
+
+int qcom_scm_sec_wdog_deactivate(void);
+int qcom_scm_get_download_mode(unsigned int *mode, phys_addr_t tcsr_boot_misc);
+int qcom_scm_update_rollback_version(void);
+int qcom_scm_assign_dump_table_region(bool is_assign, phys_addr_t addr,
+				      size_t size);
+
+
+int qcom_scm_config_set_ice_key(u32 index, phys_addr_t paddr, size_t size,
+				u32 cipher, unsigned int data_unit,
+				unsigned int ce);
+int qcom_scm_clear_ice_key(u32 index, unsigned int ce);
+int qcom_scm_derive_raw_secret(phys_addr_t paddr_key, size_t size_key,
+			       phys_addr_t paddr_secret, size_t size_secret);
+struct qcom_scm_current_perm_info;
+struct qcom_scm_mem_map_info;
+int qcom_scm_assign_mem_regions(struct qcom_scm_mem_map_info *mem_regions,
+				size_t mem_regions_sz, u32 *srcvms,
+				size_t src_sz,
+				struct qcom_scm_current_perm_info *newvms,
+				size_t newvms_sz);
+
 #endif
+
+struct qseecom_scm_desc;
+int qcom_scm_qseecom_call(u32 cmd_id, struct qseecom_scm_desc *desc, bool retry);
+
+int qcom_scm_invoke_smc_legacy(phys_addr_t in_buf, size_t in_buf_size,
+			       phys_addr_t out_buf, size_t out_buf_size,
+			       s32 *result, u64 *response_type,
+			       unsigned int *data);
+int qcom_scm_invoke_smc(phys_addr_t in_buf, size_t in_buf_size,
+			phys_addr_t out_buf, size_t out_buf_size,
+			s32 *result, u64 *response_type, unsigned int *data);
+int qcom_scm_invoke_callback_response(phys_addr_t out_buf, size_t out_buf_size,
+				      s32 *result, u64 *response_type,
+				      unsigned int *data);
+
+/* Vendor QSEELOG (TZ log) interface, needed by tz_log_dlkm */
+int qcom_scm_get_tz_log_feat_id(u64 *version);
+int qcom_scm_get_tz_feat_id_version(u64 feat_id, u64 *version);
+int qcom_scm_register_qsee_log_buf(phys_addr_t buf, size_t len);
+int qcom_scm_query_encrypted_log_feature(u64 *enabled);
+int qcom_scm_request_encrypted_log(phys_addr_t buf, size_t len, u32 log_id,
+				   bool is_full_tz_logs_supported,
+				   bool is_full_tz_logs_enabled);
