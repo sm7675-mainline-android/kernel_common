@@ -189,4 +189,9 @@ int spmi_command_sleep(struct spmi_device *sdev);
 int spmi_command_wakeup(struct spmi_device *sdev);
 int spmi_command_shutdown(struct spmi_device *sdev);
 
+/* Downstream display helper implemented in spmi-pmic-arb.c. */
+struct resource;
+int spmi_pmic_arb_map_address(const struct device *dev, u32 spmi_address,
+			      struct resource *res_out);
+
 #endif

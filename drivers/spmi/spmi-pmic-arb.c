@@ -15,6 +15,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spmi.h>
@@ -191,6 +192,7 @@ struct spmi_pmic_arb_bus {
 struct spmi_pmic_arb {
 	void __iomem		*rd_base;
 	void __iomem		*wr_base;
+	phys_addr_t		wr_base_phys;
 	void __iomem		*core;
 	resource_size_t		core_size;
 	u8			channel;
@@ -1004,6 +1006,13 @@ static int pmic_arb_get_core_resources_v1(struct platform_device *pdev,
 
 	pmic_arb->wr_base = core;
 	pmic_arb->rd_base = core;
+	{
+		struct resource *res;
+
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "core");
+		if (res)
+			pmic_arb->wr_base_phys = res->start;
+	}
 
 	pmic_arb->max_periphs = PMIC_ARB_MAX_PERIPHS;
 
@@ -1123,14 +1132,38 @@ static u16 pmic_arb_find_apid(struct spmi_pmic_arb_bus *bus, u16 ppid)
 static int pmic_arb_get_obsrvr_chnls_v2(struct platform_device *pdev)
 {
 	struct spmi_pmic_arb *pmic_arb = platform_get_drvdata(pdev);
+	struct resource *res;
 
-	pmic_arb->rd_base = devm_platform_ioremap_resource_byname(pdev, "obsrvr");
-	if (IS_ERR(pmic_arb->rd_base))
-		return PTR_ERR(pmic_arb->rd_base);
+	/*
+	 * PORT-6.18: devm_ioremap() instead of
+	 * devm_platform_ioremap_resource_byname().
+	 *
+	 * The latter goes through devm_ioremap_resource() and therefore
+	 * devm_request_mem_region().  Cliffs describes its two SPMI
+	 * arbiters the old way -- two sibling nodes, each carrying all
+	 * five reg ranges -- so "core", "chnls" and "obsrvr" are the very
+	 * same physical ranges in both nodes.  Whichever arbiter probes
+	 * first claims them and the second one dies with -EBUSY, which
+	 * means bus 1 never registers and every PMIC behind it stays
+	 * unreachable.  The vendor 6.1 driver carries the same comment.
+	 */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "obsrvr");
+	if (!res)
+		return -ENODEV;
+	pmic_arb->rd_base = devm_ioremap(&pdev->dev, res->start,
+					 resource_size(res));
+	if (!pmic_arb->rd_base)
+		return -ENOMEM;
 
-	pmic_arb->wr_base = devm_platform_ioremap_resource_byname(pdev, "chnls");
-	if (IS_ERR(pmic_arb->wr_base))
-		return PTR_ERR(pmic_arb->wr_base);
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "chnls");
+	if (!res)
+		return -ENODEV;
+	pmic_arb->wr_base = devm_ioremap(&pdev->dev, res->start,
+					 resource_size(res));
+	if (!pmic_arb->wr_base)
+		return -ENOMEM;
+
+	pmic_arb->wr_base_phys = res->start;
 
 	return 0;
 }
@@ -1665,14 +1698,47 @@ static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
 				  struct device_node *node,
 				  struct spmi_pmic_arb *pmic_arb)
 {
-	int bus_index = pmic_arb->buses_available;
 	struct spmi_pmic_arb_bus *bus;
 	struct device *dev = &pdev->dev;
 	struct spmi_controller *ctrl;
 	void __iomem *intr;
 	void __iomem *cnfg;
+	int bus_index;
 	int index, ret;
 	int irq;
+	u32 bus_id;
+
+	/*
+	 * PORT-6.18: qcom,bus-id.
+	 *
+	 * Cliffs describes its two SPMI arbiters the old way: two sibling
+	 * platform devices, each one compatible with "qcom,spmi-pmic-arb",
+	 * neither with an "spmi" child node.  That takes the legacy branch
+	 * of spmi_pmic_arb_register_buses(), so bus_index would always be
+	 * pmic_arb->buses_available == 0 and both buses would decode their
+	 * APID window from PMIC_ARB_FEATURES (the primary bus's count).
+	 * The vendor 6.1 driver reads qcom,bus-id for exactly this case.
+	 */
+	if (!of_property_read_u32(node, "qcom,bus-id", &bus_id)) {
+		if (bus_id >= PMIC_ARB_MAX_BUSES) {
+			dev_err(dev, "invalid qcom,bus-id %u\n", bus_id);
+			return -EINVAL;
+		}
+		bus_index = bus_id;
+	} else {
+		/* new-style DTS: buses are child nodes, take the next slot */
+		bus_index = 0;
+		while (bus_index < PMIC_ARB_MAX_BUSES &&
+		       pmic_arb->buses[bus_index])
+			bus_index++;
+		if (bus_index >= PMIC_ARB_MAX_BUSES)
+			return -ENOSPC;
+	}
+
+	if (pmic_arb->buses[bus_index]) {
+		dev_err(dev, "bus %d already registered\n", bus_index);
+		return -EEXIST;
+	}
 
 	ctrl = devm_spmi_controller_alloc(dev, sizeof(*bus));
 	if (IS_ERR(ctrl))
@@ -1735,6 +1801,10 @@ static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
 	if (ret)
 		return ret;
 
+	/* Report the APID window selected for this bus. */
+	dev_dbg(dev, "bus %d: base_apid=%u apid_count=%d ee=%u\n",
+		 bus_index, bus->base_apid, bus->apid_count, pmic_arb->ee);
+
 	dev_dbg(&pdev->dev, "adding irq domain for bus %d\n", bus_index);
 
 	bus->domain = irq_domain_create_tree(of_fwnode_handle(node), &pmic_arb_irq_domain_ops, bus);
@@ -1753,7 +1823,8 @@ static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
 	if (ret)
 		return ret;
 
-	pmic_arb->buses_available++;
+	if (bus_index >= pmic_arb->buses_available)
+		pmic_arb->buses_available = bus_index + 1;
 
 	return 0;
 }
@@ -1784,8 +1855,11 @@ static void spmi_pmic_arb_deregister_buses(struct spmi_pmic_arb *pmic_arb)
 {
 	int i;
 
-	for (i = 0; i < pmic_arb->buses_available; i++) {
+	for (i = 0; i < PMIC_ARB_MAX_BUSES; i++) {
 		struct spmi_pmic_arb_bus *bus = pmic_arb->buses[i];
+
+		if (!bus)
+			continue;
 
 		irq_set_chained_handler_and_data(bus->irq,
 						 NULL, NULL);
@@ -1871,6 +1945,65 @@ static void spmi_pmic_arb_remove(struct platform_device *pdev)
 
 	spmi_pmic_arb_deregister_buses(pmic_arb);
 }
+
+/**
+ * spmi_pmic_arb_map_address() - physical address of the registers used to
+ *                               issue an SPMI write to @spmi_address
+ * @dev:          consumer device (must carry a "qcom,pmic-arb" phandle)
+ * @spmi_address: 20-bit SPMI address, 0xSPPPP (S = global PMIC SID)
+ * @res_out:      caller-allocated resource filled with the register range
+ *
+ * Downstream-only helper used by the display driver to poke PMIC registers
+ * directly. Returns 0 on success or a negative errno.
+ */
+int spmi_pmic_arb_map_address(const struct device *dev, u32 spmi_address,
+			      struct resource *res_out)
+{
+	struct device_node *ctrl_node;
+	struct platform_device *ctrl_pdev;
+	struct spmi_controller *ctrl;
+	struct spmi_pmic_arb_bus *bus;
+	struct spmi_pmic_arb *pmic_arb;
+	u8 sid = (spmi_address >> 16) & 0xF;
+	u16 addr = spmi_address & 0xFFFF;
+	int rc;
+
+	if (!dev || !dev->of_node || !res_out)
+		return -EINVAL;
+
+	ctrl_node = of_parse_phandle(dev->of_node, "qcom,pmic-arb", 0);
+	if (!ctrl_node) {
+		pr_err("%s: no qcom,pmic-arb phandle\n", __func__);
+		return -ENODEV;
+	}
+
+	ctrl_pdev = of_find_device_by_node(ctrl_node);
+	of_node_put(ctrl_node);
+	if (!ctrl_pdev)
+		return -EPROBE_DEFER;
+
+	ctrl = platform_get_drvdata(ctrl_pdev);
+	if (!ctrl)
+		return -EPROBE_DEFER;
+
+	bus = spmi_controller_get_drvdata(ctrl);
+	if (!bus || !bus->pmic_arb)
+		return -ENODEV;
+
+	pmic_arb = bus->pmic_arb;
+	if (!pmic_arb->wr_base_phys)
+		return -ENODEV;
+
+	rc = pmic_arb->ver_ops->offset(bus, sid, addr, PMIC_ARB_CHANNEL_RW);
+	if (rc < 0)
+		return rc;
+
+	res_out->start = pmic_arb->wr_base_phys + rc;
+	res_out->end = res_out->start + 0x80 - 1;
+
+	return 0;
+}
+EXPORT_SYMBOL(spmi_pmic_arb_map_address);
 
 static const struct of_device_id spmi_pmic_arb_match_table[] = {
 	{ .compatible = "qcom,spmi-pmic-arb", },
