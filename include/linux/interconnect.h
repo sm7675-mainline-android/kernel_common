@@ -44,6 +44,8 @@ struct icc_bulk_data {
 #if IS_ENABLED(CONFIG_INTERCONNECT)
 
 struct icc_path *of_icc_get(struct device *dev, const char *name);
+struct icc_path *icc_get_by_id(struct device *dev, const int src_id,
+			       const int dst_id);
 struct icc_path *devm_of_icc_get(struct device *dev, const char *name);
 int devm_of_icc_bulk_get(struct device *dev, int num_paths, struct icc_bulk_data *paths);
 struct icc_path *of_icc_get_by_index(struct device *dev, int idx);

@@ -634,6 +634,40 @@ out:
 	return path;
 }
 
+/*
+ * Legacy camera and EVA consumers use numeric node IDs. Resolve these through
+ * the current node table while holding the same lock as named path lookup.
+ */
+struct icc_path *icc_get_by_id(struct device *dev, const int src_id,
+			       const int dst_id)
+{
+	struct icc_node *src, *dst;
+	struct icc_path *path = ERR_PTR(-EPROBE_DEFER);
+
+	mutex_lock(&icc_lock);
+
+	src = node_find(src_id);
+	if (!src)
+		goto out;
+	dst = node_find(dst_id);
+	if (!dst)
+		goto out;
+
+	path = path_find(dev, src, dst);
+	if (IS_ERR(path))
+		goto out;
+
+	path->name = kasprintf(GFP_KERNEL, "%s-%s", src->name, dst->name);
+	if (!path->name) {
+		kfree(path);
+		path = ERR_PTR(-ENOMEM);
+	}
+out:
+	mutex_unlock(&icc_lock);
+	return path;
+}
+EXPORT_SYMBOL_GPL(icc_get_by_id);
+
 /**
  * icc_set_tag() - set an optional tag on a path
  * @path: the path we want to tag
