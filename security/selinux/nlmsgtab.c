@@ -165,6 +165,12 @@ static int nlmsg_perm(u16 nlmsg_type, u32 *perm, const struct nlmsg_perm *tab,
 	return err;
 }
 
+int selinux_nlmsg_lookup_route_legacy(u16 nlmsg_type, u32 *perm)
+{
+	return nlmsg_perm(nlmsg_type, perm, nlmsg_route_perms,
+			  sizeof(nlmsg_route_perms));
+}
+
 int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
 {
 	/* While it is possible to add a similar permission to other netlink
@@ -187,8 +193,7 @@ int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
 			*perm = NETLINK_ROUTE_SOCKET__NLMSG;
 			return 0;
 		}
-		return nlmsg_perm(nlmsg_type, perm, nlmsg_route_perms,
-				  sizeof(nlmsg_route_perms));
+		return selinux_nlmsg_lookup_route_legacy(nlmsg_type, perm);
 		break;
 	case SECCLASS_NETLINK_TCPDIAG_SOCKET:
 		if (selinux_policycap_netlink_xperm()) {
