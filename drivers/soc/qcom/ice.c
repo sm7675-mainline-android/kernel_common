@@ -23,7 +23,6 @@
 
 #define AES_256_XTS_KEY_SIZE			64   /* for raw keys only */
 #define QCOM_ICE_HWKM_WRAPPED_KEY_SIZE		100  /* assuming HWKM v2 */
-
 /* QCOM ICE registers */
 
 #define QCOM_ICE_REG_CONTROL			0x0000
@@ -79,13 +78,36 @@ union crypto_cfg {
 #define QCOM_ICE_REG_HWKM_BANK0_BBAC_3		(HWKM_OFFSET + 0x500C)
 #define QCOM_ICE_REG_HWKM_BANK0_BBAC_4		(HWKM_OFFSET + 0x5010)
 
+/* UFS crypto engine identifier from the vendor SCM ABI. */
+#define QCOM_ICE_UFS_CE				10
+
 #define qcom_ice_writel(engine, val, reg)	\
 	writel((val), (engine)->base + (reg))
 
 #define qcom_ice_readl(engine, reg)	\
 	readl((engine)->base + (reg))
 
-static bool qcom_ice_use_wrapped_keys;
+/*
+ * The HWKM register window starts HWKM_OFFSET past the ICE base.  On the
+ * dedicated ICE DT node that is simply part of the same reg range; with the
+ * vendor UFS binding it is a separate "ufs_ice_hwkm" resource, which starts
+ * exactly at ICE base + HWKM_OFFSET.  hwkm_base points at the window in
+ * either case, so the register offsets below are expressed relative to it.
+ */
+#define qcom_ice_hwkm_writel(engine, val, reg)	\
+	writel((val), (engine)->hwkm_base + ((reg) - HWKM_OFFSET))
+
+#define qcom_ice_hwkm_readl(engine, reg)	\
+	readl((engine)->hwkm_base + ((reg) - HWKM_OFFSET))
+
+/*
+ * Vendor UFS (ufshcd-crypto-qti.c) unconditionally advertises
+ * BLK_CRYPTO_KEY_TYPE_HW_WRAPPED and the fstab mounts /data with
+ * wrappedkey_v0, so the on-disk keys are wrapped.  Default to wrapped keys;
+ * qcom_ice_check_supported() still falls back to raw keys when no HWKM is
+ * present.
+ */
+static bool qcom_ice_use_wrapped_keys = true;
 module_param_named(use_wrapped_keys, qcom_ice_use_wrapped_keys, bool, 0660);
 MODULE_PARM_DESC(use_wrapped_keys,
 		 "Support wrapped keys instead of raw keys, if available on the platform");
@@ -93,11 +115,29 @@ MODULE_PARM_DESC(use_wrapped_keys,
 struct qcom_ice {
 	struct device *dev;
 	void __iomem *base;
+	void __iomem *hwkm_base;
 
 	struct clk *core_clk;
 	bool use_hwkm;
 	bool hwkm_init_complete;
+	/* Use the vendor CE key programming interface. */
+	bool vendor_ce;
+	/* AES-XTS-256 capability index for CRYPTOCFG. */
+	u8 cap_idx;
 };
+
+/* Match the HWKM v2 ice_mmio_data ABI used by qti_hwkm_init(). */
+struct ice_mmio_data {
+	void __iomem *ice_base_mmio;
+	void __iomem *ice_hwkm_mmio;
+};
+extern int qti_hwkm_init(const struct ice_mmio_data *mmio_data);
+
+void qcom_ice_set_cap_idx(struct qcom_ice *ice, u8 cap_idx)
+{
+	ice->cap_idx = cap_idx;
+}
+EXPORT_SYMBOL_GPL(qcom_ice_set_cap_idx);
 
 static bool qcom_ice_check_supported(struct qcom_ice *ice)
 {
@@ -141,11 +181,16 @@ static bool qcom_ice_check_supported(struct qcom_ice *ice)
 	 * advertise support for raw keys or wrapped keys, HWKM cannot be used
 	 * unconditionally.  A module parameter is used to opt into using it.
 	 */
-	if ((major >= 4 ||
-	     (major == 3 && (minor >= 3 || (minor == 2 && step >= 1)))) &&
-	    qcom_scm_has_wrapped_key_support()) {
+	bool hwkm_version_ok = major >= 4 ||
+			       (major == 3 && (minor >= 3 ||
+					       (minor == 2 && step >= 1)));
+	bool scm_v2_keys = qcom_scm_has_wrapped_key_support();
+
+	if (hwkm_version_ok && (scm_v2_keys || qcom_ice_use_wrapped_keys)) {
 		if (qcom_ice_use_wrapped_keys) {
-			dev_info(dev, "Using HWKM. Supporting wrapped keys only.\n");
+			dev_info(dev, "Using HWKM. Supporting wrapped keys only%s\n",
+				 scm_v2_keys ? "" :
+				 " (SCM v2 key calls not advertised)");
 			ice->use_hwkm = true;
 		} else {
 			dev_info(dev, "Not using HWKM. Supporting raw keys only.\n");
@@ -207,8 +252,8 @@ static int qcom_ice_wait_bist_status(struct qcom_ice *ice)
 		return err;
 	}
 
-	if (ice->use_hwkm &&
-	    qcom_ice_readl(ice, QCOM_ICE_REG_HWKM_TZ_KM_STATUS) !=
+	if (ice->use_hwkm && ice->hwkm_init_complete &&
+	    qcom_ice_hwkm_readl(ice, QCOM_ICE_REG_HWKM_TZ_KM_STATUS) !=
 	    (QCOM_ICE_HWKM_KT_CLEAR_DONE |
 	     QCOM_ICE_HWKM_BOOT_CMD_LIST0_DONE |
 	     QCOM_ICE_HWKM_BOOT_CMD_LIST1_DONE |
@@ -232,6 +277,26 @@ static void qcom_ice_hwkm_init(struct qcom_ice *ice)
 
 	BUILD_BUG_ON(QCOM_ICE_HWKM_WRAPPED_KEY_SIZE >
 		     BLK_CRYPTO_MAX_HW_WRAPPED_KEY_SIZE);
+
+	/*
+	 * Vendor HWKM initialization includes the TPKEY handshake required
+	 * before firmware accepts wrapped keys.
+	 */
+	if (ice->vendor_ce) {
+		struct ice_mmio_data mmio_data = {
+			.ice_base_mmio = ice->base,
+			.ice_hwkm_mmio = ice->hwkm_base,
+		};
+		int ret = qti_hwkm_init(&mmio_data);
+
+		if (ret) {
+			dev_err(ice->dev, "qti_hwkm_init failed: %d\n", ret);
+			return;
+		}
+		ice->hwkm_init_complete = true;
+		return;
+	}
+
 	/*
 	 * When ICE is in HWKM mode, it only supports wrapped keys.
 	 * When ICE is in legacy mode, it only supports raw keys.
@@ -243,22 +308,22 @@ static void qcom_ice_hwkm_init(struct qcom_ice *ice)
 	qcom_ice_writel(ice, regval, QCOM_ICE_REG_CONTROL);
 
 	/* Disable CRC checks.  This HWKM feature is not used. */
-	qcom_ice_writel(ice, QCOM_ICE_HWKM_DISABLE_CRC_CHECKS_VAL,
-			QCOM_ICE_REG_HWKM_TZ_KM_CTL);
+	qcom_ice_hwkm_writel(ice, QCOM_ICE_HWKM_DISABLE_CRC_CHECKS_VAL,
+			     QCOM_ICE_REG_HWKM_TZ_KM_CTL);
 
 	/*
 	 * Allow the HWKM slave to read and write the keyslots in the ICE HWKM
 	 * slave.  Without this, TrustZone cannot program keys into ICE.
 	 */
-	qcom_ice_writel(ice, GENMASK(31, 0), QCOM_ICE_REG_HWKM_BANK0_BBAC_0);
-	qcom_ice_writel(ice, GENMASK(31, 0), QCOM_ICE_REG_HWKM_BANK0_BBAC_1);
-	qcom_ice_writel(ice, GENMASK(31, 0), QCOM_ICE_REG_HWKM_BANK0_BBAC_2);
-	qcom_ice_writel(ice, GENMASK(31, 0), QCOM_ICE_REG_HWKM_BANK0_BBAC_3);
-	qcom_ice_writel(ice, GENMASK(31, 0), QCOM_ICE_REG_HWKM_BANK0_BBAC_4);
+	qcom_ice_hwkm_writel(ice, GENMASK(31, 0), QCOM_ICE_REG_HWKM_BANK0_BBAC_0);
+	qcom_ice_hwkm_writel(ice, GENMASK(31, 0), QCOM_ICE_REG_HWKM_BANK0_BBAC_1);
+	qcom_ice_hwkm_writel(ice, GENMASK(31, 0), QCOM_ICE_REG_HWKM_BANK0_BBAC_2);
+	qcom_ice_hwkm_writel(ice, GENMASK(31, 0), QCOM_ICE_REG_HWKM_BANK0_BBAC_3);
+	qcom_ice_hwkm_writel(ice, GENMASK(31, 0), QCOM_ICE_REG_HWKM_BANK0_BBAC_4);
 
 	/* Clear the HWKM response FIFO. */
-	qcom_ice_writel(ice, QCOM_ICE_HWKM_RSP_FIFO_CLEAR_VAL,
-			QCOM_ICE_REG_HWKM_BANK0_BANKN_IRQ_STATUS);
+	qcom_ice_hwkm_writel(ice, QCOM_ICE_HWKM_RSP_FIFO_CLEAR_VAL,
+			     QCOM_ICE_REG_HWKM_BANK0_BANKN_IRQ_STATUS);
 	ice->hwkm_init_complete = true;
 }
 
@@ -266,7 +331,12 @@ int qcom_ice_enable(struct qcom_ice *ice)
 {
 	qcom_ice_low_power_mode_enable(ice);
 	qcom_ice_optimization_enable(ice);
-	qcom_ice_hwkm_init(ice);
+	/*
+	 * Defer vendor HWKM initialization until wrapped key programming,
+	 * after the UFS link and power mode have stabilized.
+	 */
+	if (!ice->vendor_ce)
+		qcom_ice_hwkm_init(ice);
 	return qcom_ice_wait_bist_status(ice);
 }
 EXPORT_SYMBOL_GPL(qcom_ice_enable);
@@ -282,7 +352,8 @@ int qcom_ice_resume(struct qcom_ice *ice)
 			err);
 		return err;
 	}
-	qcom_ice_hwkm_init(ice);
+	if (!ice->vendor_ce)
+		qcom_ice_hwkm_init(ice);
 	return qcom_ice_wait_bist_status(ice);
 }
 EXPORT_SYMBOL_GPL(qcom_ice_resume);
@@ -301,6 +372,35 @@ static unsigned int translate_hwkm_slot(struct qcom_ice *ice, unsigned int slot)
 	return slot * 2;
 }
 
+/* HWKM v1 and v2.0 reserve the first ten SCM slots; v2.1 and later do not. */
+#define QTI_HWKM_ICE_RG_IPCAT_VERSION		0x0000
+#define QTI_HWKM_ICE_RG_TZ_TPKEY_RECEIVE_STATUS	0x1020
+#define QTI_HWKM_SLOT_OFFSET_V1			10
+
+static unsigned int qcom_ice_hwkm_slot_offset(struct qcom_ice *ice)
+{
+	u32 val = readl(ice->hwkm_base);
+	unsigned int major = FIELD_GET(GENMASK(31, 24), val);
+	unsigned int minor = FIELD_GET(GENMASK(23, 16), val);
+
+	if (major == 1 || (major == 2 && minor < 1))
+		return QTI_HWKM_SLOT_OFFSET_V1;
+	return 0;
+}
+
+/* Check both HWKM initialization and ICE TPKEY status. */
+static bool qcom_ice_hwkm_init_required(struct qcom_ice *ice)
+{
+	return (readl(ice->base) & 0x1) == 1;
+}
+
+static bool qcom_ice_hwkm_tpkey_set(struct qcom_ice *ice)
+{
+	u32 val = readl(ice->hwkm_base + QTI_HWKM_ICE_RG_TZ_TPKEY_RECEIVE_STATUS);
+
+	return (val >> 8) == 0x1;
+}
+
 static int qcom_ice_program_wrapped_key(struct qcom_ice *ice, unsigned int slot,
 					const struct blk_crypto_key *bkey)
 {
@@ -316,9 +416,49 @@ static int qcom_ice_program_wrapped_key(struct qcom_ice *ice, unsigned int slot,
 		dev_err_ratelimited(dev, "Got wrapped key when not using HWKM\n");
 		return -EINVAL;
 	}
+	/* Initialize HWKM on demand before programming a wrapped key. */
+	if (ice->vendor_ce) {
+		if (qcom_ice_hwkm_init_required(ice) ||
+		    !qcom_ice_hwkm_tpkey_set(ice)) {
+			ice->hwkm_init_complete = false;
+			qcom_ice_hwkm_init(ice);
+		} else {
+			ice->hwkm_init_complete = true;
+		}
+	}
 	if (!ice->hwkm_init_complete) {
 		dev_err_ratelimited(dev, "HWKM not yet initialized\n");
 		return -EINVAL;
+	}
+
+	/*
+	 * Wrapped key programming passes zero cipher, data unit and CE
+	 * arguments. Firmware unwraps the key; software programs the ICE
+	 * CRYPTOCFG.
+	 */
+	if (ice->vendor_ce) {
+		unsigned int offset = qcom_ice_hwkm_slot_offset(ice);
+		unsigned int scm_slot = translate_hwkm_slot(ice, slot) + offset;
+
+		/* Clear CFGE before programming the key. */
+		qcom_ice_writel(ice, 0x0, QCOM_ICE_REG_CRYPTOCFG(slot));
+		wmb();
+
+		err = qcom_scm_ice_set_key_ce(scm_slot,
+					      bkey->bytes, bkey->size, 0, 0, 0);
+		if (err) {
+			dev_err_ratelimited(dev,
+					    "qcom_scm_ice_set_key_ce(hwkm) failed; err=%d, slot=%u(scm=%u), size=%u, du=%u\n",
+					    err, slot, scm_slot, bkey->size,
+					    bkey->crypto_cfg.data_unit_size);
+			return err;
+		}
+
+		cfg.capidx = ice->cap_idx;
+		qcom_ice_writel(ice, le32_to_cpu(cfg.regval),
+				QCOM_ICE_REG_CRYPTOCFG(slot));
+		wmb();
+		return 0;
 	}
 
 	/* Clear CFGE before programming the key. */
@@ -389,6 +529,13 @@ EXPORT_SYMBOL_GPL(qcom_ice_program_key);
 
 int qcom_ice_evict_key(struct qcom_ice *ice, int slot)
 {
+	/*
+	 * Use the legacy invalidate command for vendor keyslots; preserve
+	 * the firmware interface used during host crypto initialization.
+	 */
+	if (ice->vendor_ce)
+		return qcom_scm_ice_invalidate_key(slot);
+
 	if (ice->hwkm_init_complete)
 		slot = translate_hwkm_slot(ice, slot);
 	return qcom_scm_ice_invalidate_key(slot);
@@ -533,6 +680,7 @@ static struct qcom_ice *qcom_ice_create(struct device *dev,
 
 	engine->dev = dev;
 	engine->base = base;
+	engine->hwkm_base = base;
 
 	/*
 	 * Legacy DT binding uses different clk names for each consumer,
@@ -540,10 +688,14 @@ static struct qcom_ice *qcom_ice_create(struct device *dev,
 	 * the we only have one clock and it is part of the dedicated DT node.
 	 * Also, enable the clock before we check what HW version the driver
 	 * supports.
+	 *
+	 * The vendor UFS binding calls this clock "core_clk_ice".
 	 */
 	engine->core_clk = devm_clk_get_optional_enabled(dev, "ice_core_clk");
 	if (!engine->core_clk)
 		engine->core_clk = devm_clk_get_optional_enabled(dev, "ice");
+	if (!engine->core_clk)
+		engine->core_clk = devm_clk_get_optional_enabled(dev, "core_clk_ice");
 	if (!engine->core_clk)
 		engine->core_clk = devm_clk_get_enabled(dev, NULL);
 	if (IS_ERR(engine->core_clk))
@@ -597,6 +749,37 @@ static struct qcom_ice *of_qcom_ice_get(struct device *dev)
 	}
 
 	/*
+	 * Vendor UFS binding: the ICE register window is the "ufs_ice" reg
+	 * range of the UFS node itself, and the HWKM window is a separate
+	 * "ufs_ice_hwkm" range that starts at ICE base + HWKM_OFFSET.
+	 */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "ufs_ice");
+	if (res) {
+		void __iomem *hwkm_base = NULL;
+		struct resource *hwkm_res;
+
+		base = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(base))
+			return ERR_CAST(base);
+
+		hwkm_res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+							"ufs_ice_hwkm");
+		if (hwkm_res) {
+			hwkm_base = devm_ioremap_resource(&pdev->dev, hwkm_res);
+			if (IS_ERR(hwkm_base))
+				return ERR_CAST(hwkm_base);
+		}
+
+		ice = qcom_ice_create(&pdev->dev, base);
+		if (IS_ERR_OR_NULL(ice))
+			return ice;
+		ice->vendor_ce = true;
+		if (hwkm_base)
+			ice->hwkm_base = hwkm_base;
+		return ice;
+	}
+
+	/*
 	 * If the consumer node does not provider an 'ice' reg range
 	 * (legacy DT binding), then it must at least provide a phandle
 	 * to the ICE devicetree node, otherwise ICE is not supported.
@@ -636,7 +819,13 @@ static void qcom_ice_put(const struct qcom_ice *ice)
 {
 	struct platform_device *pdev = to_platform_device(ice->dev);
 
-	if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, "ice"))
+	/*
+	 * If the ICE instance was created from the consumer's own DT node
+	 * (legacy "ice" reg, or the vendor UFS "ufs_ice" reg), there is no
+	 * extra reference to drop here.
+	 */
+	if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, "ice") &&
+	    !platform_get_resource_byname(pdev, IORESOURCE_MEM, "ufs_ice"))
 		platform_device_put(pdev);
 }
 
