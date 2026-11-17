@@ -17,6 +17,9 @@
 #include <linux/device.h>
 #include <linux/io-64-nonatomic-hi-lo.h>
 #include <linux/io-pgtable.h>
+#include <linux/qcom-io-pgtable.h>
+#include <linux/qcom-iommu-util.h>
+#include "qcom-io-pgtable-alloc.h"
 #include <linux/iommu.h>
 #include <linux/irqreturn.h>
 #include <linux/mutex.h>
@@ -277,6 +280,11 @@ struct arm_smmu_s2cr {
 	enum arm_smmu_s2cr_type		type;
 	enum arm_smmu_s2cr_privcfg	privcfg;
 	u8				cbndx;
+	/*
+	 * Pinned firmware stream mappings must survive reset and context
+	 * teardown.
+	 */
+	bool				pinned;
 };
 
 struct arm_smmu_smr {
@@ -320,6 +328,16 @@ struct arm_smmu_device {
 	atomic_t			irptndx;
 
 	u32				num_mapping_groups;
+
+	/*
+	 * Preserve firmware sCR0 and skip global invalidation on the first
+	 * handoff reset.
+	 */
+	bool				handoff_active;
+	bool				boot_scr0_valid;
+	bool				preserve_scr0_once;
+	u32				boot_scr0;
+
 	u16				streamid_mask;
 	u16				smr_mask_mask;
 	struct arm_smmu_smr		*smrs;
@@ -335,6 +353,9 @@ struct arm_smmu_device {
 	int				num_clks;
 	unsigned int			*irqs;
 	struct clk_bulk_data		*clks;
+	struct regulator_bulk_data	*supplies;
+	unsigned int			num_supplies;
+	bool				supplies_enabled;
 
 	spinlock_t			global_sync_lock;
 
@@ -359,6 +380,7 @@ struct arm_smmu_cfg {
 	enum arm_smmu_cbar_type		cbar;
 	enum arm_smmu_context_fmt	fmt;
 	bool				flush_walk_prefer_tlbiasid;
+	bool				batch_leaf_tlbi;
 };
 #define ARM_SMMU_INVALID_IRPTNDX	0xff
 
@@ -385,6 +407,24 @@ struct arm_smmu_domain {
 	struct mutex			init_mutex; /* Protects smmu pointer */
 	spinlock_t			cb_lock; /* Serialises ATS1* ops and TLB syncs */
 	struct iommu_domain		domain;
+
+	/*
+	 * Share the domain page table configuration with the vendor GPU
+	 * allocator.
+	 */
+	struct qcom_io_pgtable_info	pgtbl_info;
+
+	/* Domain state for vendor qcom_iommu operations. */
+	u32				secure_vmid;
+	bool				skip_tlb_management;
+
+	/*
+	 * Reclaim unmapped GPU page tables only after TLB maintenance
+	 * completes.
+	 */
+	spinlock_t			iotlb_gather_lock;
+	struct list_head		*freelist;
+	bool				deferred_flush;
 };
 
 struct arm_smmu_master_cfg {

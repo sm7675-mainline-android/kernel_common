@@ -231,26 +231,27 @@ static int qcom_adreno_smmu_set_ttbr0_cfg(const void *cookie,
 	struct io_pgtable *pgtable = io_pgtable_ops_to_pgtable(smmu_domain->pgtbl_ops);
 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
 	struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	int ret;
 
 	/* The domain must have split pagetables already enabled */
 	if (cb->tcr[0] & ARM_SMMU_TCR_EPD1)
 		return -EINVAL;
 
+	if (!!(cb->tcr[0] & ARM_SMMU_TCR_EPD0) != !!pgtbl_cfg)
+		return -EINVAL;
+
+	ret = pm_runtime_resume_and_get(smmu->dev);
+	if (ret < 0)
+		return ret;
+
 	/* If the pagetable config is NULL, disable TTBR0 */
 	if (!pgtbl_cfg) {
-		/* Do nothing if it is already disabled */
-		if ((cb->tcr[0] & ARM_SMMU_TCR_EPD0))
-			return -EINVAL;
-
 		/* Set TCR to the original configuration */
 		cb->tcr[0] = arm_smmu_lpae_tcr(&pgtable->cfg);
 		cb->ttbr[0] = FIELD_PREP(ARM_SMMU_TTBRn_ASID, cb->cfg->asid);
 	} else {
 		u32 tcr = cb->tcr[0];
-
-		/* Don't call this again if TTBR0 is already enabled */
-		if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD0))
-			return -EINVAL;
 
 		tcr |= arm_smmu_lpae_tcr(pgtbl_cfg);
 		tcr &= ~(ARM_SMMU_TCR_EPD0 | ARM_SMMU_TCR_EPD1);
@@ -261,6 +262,12 @@ static int qcom_adreno_smmu_set_ttbr0_cfg(const void *cookie,
 	}
 
 	arm_smmu_write_context_bank(smmu_domain->smmu, cb->cfg->cbndx);
+	dev_dbg(smmu->dev,
+		"GPU SMMU TTBR0 config cb=%u enabled=%u cached=0x%llx hw=0x%llx tcr=0x%x\n",
+		cfg->cbndx, !!pgtbl_cfg, cb->ttbr[0],
+		arm_smmu_cb_readq(smmu, cfg->cbndx, ARM_SMMU_CB_TTBR0), cb->tcr[0]);
+	pm_runtime_mark_last_busy(smmu->dev);
+	pm_runtime_put_autosuspend(smmu->dev);
 
 	return 0;
 }
@@ -331,6 +338,11 @@ static int qcom_adreno_smmu_init_context(struct arm_smmu_domain *smmu_domain,
 	if (!qcom_adreno_smmu_is_gpu_device(dev))
 		return 0;
 
+	priv = dev_get_drvdata(dev);
+	if (!priv)
+		return dev_err_probe(dev, -EINVAL,
+				     "GPU SMMU context: private interface not ready\n");
+
 	/*
 	 * All targets that use the qcom,adreno-smmu compatible string *should*
 	 * be AARCH64 stage 1 but double check because the arm-smmu code assumes
@@ -345,8 +357,12 @@ static int qcom_adreno_smmu_init_context(struct arm_smmu_domain *smmu_domain,
 	 * Initialize private interface with GPU:
 	 */
 
-	priv = dev_get_drvdata(dev);
 	priv->cookie = smmu_domain;
+	/*
+	 * Expose the domain's page table configuration, including TTBR1
+	 * quirks, to the vendor GPU page table allocator.
+	 */
+	priv->pgtbl_info = smmu_domain->pgtbl_info;
 	priv->get_ttbr1_cfg = qcom_adreno_smmu_get_ttbr1_cfg;
 	priv->set_ttbr0_cfg = qcom_adreno_smmu_set_ttbr0_cfg;
 	priv->get_fault_info = qcom_adreno_smmu_get_fault_info;
@@ -360,6 +376,10 @@ static int qcom_adreno_smmu_init_context(struct arm_smmu_domain *smmu_domain,
 		priv->set_prr_bit = qcom_adreno_smmu_set_prr_bit;
 		priv->set_prr_addr = qcom_adreno_smmu_set_prr_addr;
 	}
+
+	dev_dbg(dev, "GPU SMMU context prepared: cb=%d type=%u ttbr1=%d\n",
+		 cbndx, smmu_domain->domain.type,
+		 !!(pgtbl_cfg->quirks & IO_PGTABLE_QUIRK_ARM_TTBR1));
 
 	return 0;
 }
@@ -398,6 +418,9 @@ static int qcom_smmu_init_context(struct arm_smmu_domain *smmu_domain,
 	int cbndx = smmu_domain->cfg.cbndx;
 
 	smmu_domain->cfg.flush_walk_prefer_tlbiasid = true;
+	smmu_domain->cfg.batch_leaf_tlbi =
+		of_device_is_compatible(dev->of_node, "qcom,msm-cam-smmu-cb") ||
+		of_device_is_compatible(dev->of_node, "qcom,qsmmu-cam-cb");
 
 	client_match = qsmmu->data->client_match;
 
@@ -548,6 +571,20 @@ static int qcom_smmu_def_domain_type(struct device *dev)
 	return match ? IOMMU_DOMAIN_IDENTITY : 0;
 }
 
+static int qcom_adreno_smmu_def_domain_type(struct device *dev)
+{
+	const char *mode;
+
+	if (of_device_is_compatible(dev->of_node, "qcom,smmu-kgsl-cb") &&
+	    !of_property_read_string(dev->of_node, "qcom,iommu-dma", &mode) &&
+	    !strcmp(mode, "disabled")) {
+		dev_dbg(dev, "GPU SMMU default domain: identity, KGSL manages paging\n");
+		return IOMMU_DOMAIN_IDENTITY;
+	}
+
+	return qcom_smmu_def_domain_type(dev);
+}
+
 static int qcom_sdm845_smmu500_reset(struct arm_smmu_device *smmu)
 {
 	int ret;
@@ -604,7 +641,7 @@ static const struct arm_smmu_impl sdm845_smmu_500_impl = {
 static const struct arm_smmu_impl qcom_adreno_smmu_v2_impl = {
 	.init_context = qcom_adreno_smmu_init_context,
 	.cfg_probe = qcom_adreno_smmuv2_cfg_probe,
-	.def_domain_type = qcom_smmu_def_domain_type,
+	.def_domain_type = qcom_adreno_smmu_def_domain_type,
 	.alloc_context_bank = qcom_adreno_smmu_alloc_context_bank,
 	.write_sctlr = qcom_adreno_smmu_write_sctlr,
 	.tlb_sync = qcom_smmu_tlb_sync,
@@ -613,7 +650,7 @@ static const struct arm_smmu_impl qcom_adreno_smmu_v2_impl = {
 
 static const struct arm_smmu_impl qcom_adreno_smmu_500_impl = {
 	.init_context = qcom_adreno_smmu_init_context,
-	.def_domain_type = qcom_smmu_def_domain_type,
+	.def_domain_type = qcom_adreno_smmu_def_domain_type,
 	.reset = arm_mmu500_reset,
 	.alloc_context_bank = qcom_adreno_smmu_alloc_context_bank,
 	.write_sctlr = qcom_adreno_smmu_write_sctlr,
@@ -724,6 +761,11 @@ static const struct of_device_id __maybe_unused qcom_smmu_impl_of_match[] = {
 	{ .compatible = "qcom,sm8250-smmu-500", .data = &qcom_smmu_500_impl0_data },
 	{ .compatible = "qcom,sm8350-smmu-500", .data = &qcom_smmu_500_impl0_data },
 	{ .compatible = "qcom,sm8450-smmu-500", .data = &qcom_smmu_500_impl0_data },
+/*
+ * Select the Qualcomm implementation for vendor qsmmu-v500 bindings,
+ * including the Adreno private interface.
+ */
+	{ .compatible = "qcom,qsmmu-v500", .data = &qcom_smmu_500_impl0_data },
 	{ .compatible = "qcom,smmu-500", .data = &qcom_smmu_500_impl0_data },
 	{ }
 };
