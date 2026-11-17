@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of_address.h>
+#include <linux/io.h>
 #include "qcom_pil_info.h"
 
 /*
@@ -26,6 +27,51 @@ struct pil_reloc {
 
 static struct pil_reloc _reloc __read_mostly;
 static DEFINE_MUTEX(pil_reloc_lock);
+static bool timeouts_disabled;
+
+/**
+ * qcom_pil_timeouts_disabled() - Check if PIL timeouts are disabled in IMEM
+ *
+ * Return: true if the value 0x53444247 is set in the disable timeout PIL
+ * IMEM region, false otherwise.
+ */
+bool qcom_pil_timeouts_disabled(void)
+{
+	struct device_node *np;
+	struct resource imem;
+	void __iomem *base;
+	int ret;
+	const char *prop = "qcom,msm-imem-pil-disable-timeout";
+
+	np = of_find_compatible_node(NULL, NULL, prop);
+	if (!np) {
+		pr_err("%s entry missing!\n", prop);
+		goto out;
+	}
+
+	ret = of_address_to_resource(np, 0, &imem);
+	of_node_put(np);
+	if (ret < 0) {
+		pr_err("address to resource conversion failed for %s\n", prop);
+		goto out;
+	}
+
+	base = ioremap(imem.start, resource_size(&imem));
+	if (!base) {
+		pr_err("failed to map PIL disable timeouts region\n");
+		goto out;
+	}
+
+	timeouts_disabled = (__raw_readl(base) == 0x53444247);
+	if (timeouts_disabled)
+		pr_info("pil-imem set to disable pil timeouts\n");
+
+	iounmap(base);
+
+out:
+	return timeouts_disabled;
+}
+EXPORT_SYMBOL(qcom_pil_timeouts_disabled);
 
 static int qcom_pil_info_init(void)
 {
