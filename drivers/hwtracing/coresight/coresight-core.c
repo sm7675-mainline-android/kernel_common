@@ -54,6 +54,7 @@ const u32 coresight_barrier_pkt[4] = {0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fff
 EXPORT_SYMBOL_GPL(coresight_barrier_pkt);
 
 static const struct cti_assoc_op *cti_assoc_ops;
+static const struct csr_set_atid_op *csr_set_atid_ops;
 
 void coresight_set_cti_ops(const struct cti_assoc_op *cti_op)
 {
@@ -66,6 +67,67 @@ void coresight_remove_cti_ops(void)
 	cti_assoc_ops = NULL;
 }
 EXPORT_SYMBOL_GPL(coresight_remove_cti_ops);
+
+void coresight_set_csr_ops(const struct csr_set_atid_op *csr_op)
+{
+	csr_set_atid_ops = csr_op;
+}
+EXPORT_SYMBOL(coresight_set_csr_ops);
+
+void coresight_remove_csr_ops(void)
+{
+	csr_set_atid_ops = NULL;
+}
+EXPORT_SYMBOL(coresight_remove_csr_ops);
+
+static struct coresight_device *coresight_get_source(struct coresight_path *path);
+
+static int coresight_set_csr_atid(struct coresight_path *path,
+				  struct coresight_device *sink_csdev,
+				  bool enable)
+{
+	int i, num, ret = 0;
+	struct coresight_device *src_csdev;
+	u32 *atid;
+	u32 atid_offset;
+
+	src_csdev = coresight_get_source(path);
+	if (!src_csdev)
+		return -EINVAL;
+
+	num = of_coresight_get_atid_number(src_csdev);
+	if (num < 0)
+		return num;
+
+	atid = kcalloc(num, sizeof(*atid), GFP_ATOMIC);
+	if (!atid)
+		return -ENOMEM;
+
+	ret = of_coresight_get_atid(src_csdev, atid, num);
+	if (ret < 0) {
+		kfree(atid);
+		return ret;
+	}
+
+	if (csr_set_atid_ops) {
+		ret = of_coresight_get_csr_atid_offset(sink_csdev, &atid_offset);
+		if (!ret) {
+			for (i = 0; i < num; i++) {
+				ret = csr_set_atid_ops->set_atid(sink_csdev,
+							atid_offset,
+							atid[i], enable);
+				if (ret < 0) {
+					kfree(atid);
+					return ret;
+				}
+			}
+		}
+	} else
+		ret = -EINVAL;
+
+	kfree(atid);
+	return ret;
+}
 
 void coresight_set_percpu_sink(int cpu, struct coresight_device *csdev)
 {
@@ -447,6 +509,11 @@ static void coresight_disable_path_from(struct coresight_path *path,
 
 		switch (type) {
 		case CORESIGHT_DEV_TYPE_SINK:
+			if (csdev->type == CORESIGHT_DEV_TYPE_SINK &&
+			    csdev->subtype.sink_subtype ==
+				CORESIGHT_DEV_SUBTYPE_SINK_SYSMEM)
+				coresight_set_csr_atid(path, csdev, false);
+
 			coresight_disable_sink(csdev);
 			break;
 		case CORESIGHT_DEV_TYPE_SOURCE:
@@ -538,6 +605,13 @@ int coresight_enable_path(struct coresight_path *path, enum cs_mode mode,
 			if (ret) {
 				coresight_disable_helpers(csdev, path);
 				goto out;
+			}
+
+			if (csdev->type == CORESIGHT_DEV_TYPE_SINK) {
+				ret = coresight_set_csr_atid(path, csdev, true);
+				if (ret)
+					dev_dbg(&csdev->dev,
+						"Set csr atid register fail\n");
 			}
 			break;
 		case CORESIGHT_DEV_TYPE_SOURCE:
