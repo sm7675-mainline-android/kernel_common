@@ -11,6 +11,7 @@
 
 struct qcom_ice;
 
+void qcom_ice_set_cap_idx(struct qcom_ice *ice, u8 cap_idx);
 int qcom_ice_enable(struct qcom_ice *ice);
 int qcom_ice_resume(struct qcom_ice *ice);
 int qcom_ice_suspend(struct qcom_ice *ice);
