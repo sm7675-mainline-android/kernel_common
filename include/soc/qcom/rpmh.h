@@ -44,4 +44,17 @@ static inline void rpmh_invalidate(const struct device *dev)
 
 #endif /* CONFIG_QCOM_RPMH */
 
+
+int rpmh_init_fast_path(const struct device *dev, struct tcs_cmd *cmd, int n);
+int rpmh_update_fast_path(const struct device *dev, struct tcs_cmd *cmd,
+			  int n, u32 update_mask);
+
+/* Downstream display RSC helpers, implemented in rpmh.c. */
+int rpmh_write_sleep_and_wake(const struct device *dev);
+int rpmh_mode_solver_set(const struct device *dev, bool enable);
+const struct device *rpmh_get_device(const char *name, u32 drv_id);
+int rpmh_drv_start(const struct device *dev);
+int rpmh_drv_stop(const struct device *dev);
+int rpmh_write_sleep_and_wake_no_child(const struct device *dev);
+
 #endif /* __SOC_QCOM_RPMH_H__ */

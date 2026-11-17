@@ -16,6 +16,7 @@
 #include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
@@ -39,6 +40,14 @@
 
 
 #define RSC_DRV_ID			0
+#define RSC_HW_TCS_COMPLETE		0x494
+#define RSC_HW_CHANNEL_UPDATE		0x498
+#define RSC_HW_CHANNEL_BUSY		0x49c
+#define RSC_HW_CHANNEL_ENABLE		0x4a0
+#define RSC_HW_TIMEOUT_US		100
+
+static LIST_HEAD(rpmh_hw_drvs);
+static DEFINE_MUTEX(rpmh_hw_drvs_lock);
 
 #define MAJOR_VER_MASK			0xFF
 #define MAJOR_VER_SHIFT			16
@@ -71,7 +80,7 @@ enum {
 /* DRV TCS Configuration Information Register */
 #define DRV_NUM_TCS_MASK		0x3F
 #define DRV_NUM_TCS_SHIFT		6
-#define DRV_NCPT_MASK			0x1F
+#define DRV_NCPT_MASK			0x1FU
 #define DRV_NCPT_SHIFT			27
 
 /* Offsets for CONTROL TCS Registers */
@@ -259,17 +268,25 @@ static void write_tcs_reg_sync(const struct rsc_drv *drv, int reg, int tcs_id,
  * function is called, since otherwise the device may immediately become
  * used again even before this function exits.
  */
+static struct tcs_group *rpmh_tcs_group(struct rsc_drv *drv, int type)
+{
+	return drv->channel ? &drv->hw_tcs[type] : &drv->tcs[type];
+}
+
 static void tcs_invalidate(struct rsc_drv *drv, int type)
 {
 	int m;
-	struct tcs_group *tcs = &drv->tcs[type];
+	struct tcs_group *tcs = rpmh_tcs_group(drv, type);
 
 	/* Caller ensures nobody else is running so no lock */
 	if (bitmap_empty(tcs->slots, MAX_TCS_SLOTS))
 		return;
 
-	for (m = tcs->offset; m < tcs->offset + tcs->num_tcs; m++)
+	for (m = tcs->offset; m < tcs->offset + tcs->num_tcs; m++) {
 		write_tcs_reg_sync(drv, drv->regs[RSC_DRV_CMD_ENABLE], m, 0);
+		if (drv->hw_channel)
+			write_tcs_reg_sync(drv, drv->regs[RSC_DRV_CMD_WAIT_FOR_CMPL], m, 0);
+	}
 
 	bitmap_zero(tcs->slots, MAX_TCS_SLOTS);
 }
@@ -318,6 +335,13 @@ static struct tcs_group *get_tcs_for_msg(struct rsc_drv *drv,
 		return ERR_PTR(-EINVAL);
 	}
 
+	/* Hardware channels accept sleep and wake requests only. */
+	if (drv->hw_channel && msg->state == RPMH_ACTIVE_ONLY_STATE) {
+		pr_err_once("rpmh: %s: hw-channel RSC rejects ACTIVE_ONLY request\n",
+			    drv->name);
+		return ERR_PTR(-EINVAL);
+	}
+
 	/*
 	 * If we are making an active request on a RSC that does not have a
 	 * dedicated TCS for active state use, then re-purpose a wake TCS to
@@ -325,7 +349,7 @@ static struct tcs_group *get_tcs_for_msg(struct rsc_drv *drv,
 	 * transfers have finished before we use it (maybe by running from
 	 * the last CPU in PM code).
 	 */
-	tcs = &drv->tcs[type];
+	tcs = rpmh_tcs_group(drv, type);
 	if (msg->state == RPMH_ACTIVE_ONLY_STATE && !tcs->num_tcs)
 		tcs = &drv->tcs[WAKE_TCS];
 
@@ -521,6 +545,70 @@ static void __tcs_buffer_write(struct rsc_drv *drv, int tcs_id, int cmd_id,
 	write_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], tcs_id, cmd_enable);
 }
 
+int rpmh_rsc_init_fast_path(struct rsc_drv *drv, const struct tcs_request *msg)
+{
+	struct tcs_group *tcs = &drv->fast_tcs;
+	unsigned long flags;
+	u32 status;
+	int ret;
+
+	if (!tcs->num_tcs || drv->hw_channel)
+		return -ENODEV;
+	if (!msg->cmds || !msg->num_cmds || msg->num_cmds > tcs->ncpt)
+		return -EINVAL;
+	spin_lock_irqsave(&drv->lock, flags);
+	ret = read_poll_timeout_atomic(read_tcs_reg, status, status, 1, 5,
+				       false, drv, drv->regs[RSC_DRV_STATUS],
+				       tcs->offset);
+	if (ret) {
+		ret = -EBUSY;
+		goto out;
+	}
+	enable_tcs_irq(drv, tcs->offset, false);
+	write_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], tcs->offset, 0);
+	__tcs_buffer_write(drv, tcs->offset, 0, msg);
+	drv->fast_num_cmds = msg->num_cmds;
+out:
+	spin_unlock_irqrestore(&drv->lock, flags);
+	return ret;
+}
+
+int rpmh_rsc_update_fast_path(struct rsc_drv *drv,
+			      const struct tcs_request *msg, u32 mask)
+{
+	struct tcs_group *tcs = &drv->fast_tcs;
+	unsigned long flags;
+	u32 status;
+	int cmd_idx, ret;
+
+	if (!tcs->num_tcs || drv->hw_channel)
+		return -ENODEV;
+	if (!msg->cmds || !msg->num_cmds || msg->num_cmds > tcs->ncpt ||
+	    !mask || (mask & ~GENMASK(msg->num_cmds - 1, 0)))
+		return -EINVAL;
+	spin_lock_irqsave(&drv->lock, flags);
+	if (msg->num_cmds != drv->fast_num_cmds) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = read_poll_timeout_atomic(read_tcs_reg, status, status, 1, 5,
+				       false, drv, drv->regs[RSC_DRV_STATUS],
+				       tcs->offset);
+	if (ret) {
+		ret = -EBUSY;
+		goto out;
+	}
+	for (cmd_idx = 0; cmd_idx < msg->num_cmds; cmd_idx++) {
+		if (mask & BIT(cmd_idx))
+			write_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_DATA],
+				      tcs->offset, cmd_idx, msg->cmds[cmd_idx].data);
+	}
+	__tcs_set_trigger(drv, tcs->offset, true);
+out:
+	spin_unlock_irqrestore(&drv->lock, flags);
+	return ret;
+}
+
 /**
  * check_for_req_inflight() - Look to see if conflicting cmds are in flight.
  * @drv: The controller.
@@ -644,6 +732,21 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	struct tcs_group *tcs;
 	int tcs_id;
 
+	/* Reject malformed requests before accessing their command array. */
+	if (!drv || !msg || !msg->cmds || !msg->num_cmds ||
+	    msg->num_cmds > MAX_RPMH_PAYLOAD) {
+		pr_err_ratelimited("rpmh: invalid request n=%u state=%d\n",
+				   msg ? msg->num_cmds : 0,
+				   msg ? (int)msg->state : -1);
+		return -EINVAL;
+	}
+
+	if (!drv->regs || !drv->tcs_base) {
+		pr_err_ratelimited("rpmh: %s has no regs/tcs_base\n",
+		       drv->name ? drv->name : "?");
+		return -EINVAL;
+	}
+
 	might_sleep();
 
 	tcs = get_tcs_for_msg(drv, msg);
@@ -680,7 +783,6 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	 */
 	__tcs_buffer_write(drv, tcs_id, 0, msg);
 	__tcs_set_trigger(drv, tcs_id, true);
-
 	return 0;
 }
 
@@ -774,6 +876,10 @@ static bool rpmh_rsc_ctrlr_is_busy(struct rsc_drv *drv)
 	unsigned long set;
 	const struct tcs_group *tcs = &drv->tcs[ACTIVE_TCS];
 	unsigned long max;
+
+	if (drv->fast_num_cmds &&
+	    !read_tcs_reg(drv, drv->regs[RSC_DRV_STATUS], drv->fast_tcs.offset))
+		return true;
 
 	/*
 	 * If we made an active request on a RSC that does not have a
@@ -957,18 +1063,93 @@ static int rpmh_rsc_pd_attach(struct rsc_drv *drv, struct device *dev)
 	return ret;
 }
 
-static int rpmh_probe_tcs_config(struct platform_device *pdev, struct rsc_drv *drv)
+/* Read upstream RSC properties first, then vendor drv child properties. */
+static int rpmh_read_drv_prop_u32(struct device_node *dn,
+				  struct device_node *drv_np,
+				  const char *prop, u32 *val)
+{
+	int ret = of_property_read_u32(dn, prop, val);
+
+	if (ret && drv_np)
+		ret = of_property_read_u32(drv_np, prop, val);
+
+	return ret;
+}
+
+/*
+ * Find the TCS configuration on the RSC, drv or channel node. The caller
+ * must put the returned node reference.
+ */
+static struct device_node *rpmh_tcs_config_node(struct device_node *dn,
+						struct device_node *drv_np)
+{
+	struct device_node *np;
+
+	if (drv_np) {
+		if (of_property_present(drv_np, "qcom,tcs-config"))
+			return of_node_get(drv_np);
+
+		np = of_get_child_by_name(drv_np, "channel");
+		if (np)
+			return np;
+	}
+
+	if (of_property_present(dn, "qcom,tcs-config"))
+		return of_node_get(dn);
+
+	return NULL;
+}
+
+static bool rpmh_has_tcs_config(struct device_node *np)
+{
+	struct device_node *ch __free(device_node) = NULL;
+
+	if (of_property_present(np, "qcom,tcs-config"))
+		return true;
+
+	ch = of_get_child_by_name(np, "channel");
+	if (!ch)
+		return false;
+
+	return of_property_present(ch, "qcom,tcs-config");
+}
+
+/*
+ * Find the drv child that owns TCS configuration, or use the RSC node for
+ * upstream bindings.
+ */
+static struct device_node *rpmh_find_drv_child(struct device_node *dn)
+{
+	struct device_node *child;
+
+	/* Transfer the iterator's node reference to the caller. */
+	for_each_child_of_node(dn, child) {
+		if (!of_node_name_eq(child, "drv"))
+			continue;
+		if (!of_property_present(child, "qcom,tcs-offset"))
+			continue;
+		if (rpmh_has_tcs_config(child))
+			return child;
+	}
+
+	return NULL;
+}
+
+static int rpmh_probe_channel_config(struct platform_device *pdev,
+				    struct device_node *drv_np, struct rsc_drv *drv,
+				    struct device_node *cfg_np,
+				    struct tcs_group *groups)
 {
 	struct tcs_type_config {
 		u32 type;
 		u32 n;
-	} tcs_cfg[TCS_TYPE_NR] = { { 0 } };
+	} tcs_cfg[TCS_TYPE_NR + 1] = { { 0 } };
 	struct device_node *dn = pdev->dev.of_node;
 	u32 config, max_tcs, ncpt, offset;
-	int i, ret, n, st = 0;
+	int i, j, ret, n, st = drv->num_tcs;
 	struct tcs_group *tcs;
 
-	ret = of_property_read_u32(dn, "qcom,tcs-offset", &offset);
+	ret = rpmh_read_drv_prop_u32(dn, drv_np, "qcom,tcs-offset", &offset);
 	if (ret)
 		return ret;
 	drv->tcs_base = drv->base + offset;
@@ -981,31 +1162,67 @@ static int rpmh_probe_tcs_config(struct platform_device *pdev, struct rsc_drv *d
 
 	ncpt = config & (DRV_NCPT_MASK << DRV_NCPT_SHIFT);
 	ncpt = ncpt >> DRV_NCPT_SHIFT;
-
-	n = of_property_count_u32_elems(dn, "qcom,tcs-config");
-	if (n != 2 * TCS_TYPE_NR)
+	if (!ncpt || ncpt > MAX_CMDS_PER_TCS)
 		return -EINVAL;
 
-	for (i = 0; i < TCS_TYPE_NR; i++) {
-		ret = of_property_read_u32_index(dn, "qcom,tcs-config",
-						 i * 2, &tcs_cfg[i].type);
-		if (ret)
-			return ret;
-		if (tcs_cfg[i].type >= TCS_TYPE_NR)
-			return -EINVAL;
-
-		ret = of_property_read_u32_index(dn, "qcom,tcs-config",
-						 i * 2 + 1, &tcs_cfg[i].n);
-		if (ret)
-			return ret;
-		if (tcs_cfg[i].n > MAX_TCS_PER_TYPE)
-			return -EINVAL;
+	if (!cfg_np) {
+		dev_err(&pdev->dev, "no qcom,tcs-config on %pOF or its drv children\n",
+			dn);
+		return -EINVAL;
 	}
 
-	for (i = 0; i < TCS_TYPE_NR; i++) {
-		tcs = &drv->tcs[tcs_cfg[i].type];
-		if (tcs->drv)
+	n = of_property_count_u32_elems(cfg_np, "qcom,tcs-config");
+	if (n < 2 * TCS_TYPE_NR || n > 2 * ARRAY_SIZE(tcs_cfg) || n % 2) {
+		dev_err(&pdev->dev, "%pOF: qcom,tcs-config has %d cells, need >= %d\n",
+			cfg_np, n, 2 * TCS_TYPE_NR);
+		return -EINVAL;
+	}
+
+	for (i = 0, j = 0; i < n / 2; i++) {
+		u32 type, cnt;
+
+		ret = of_property_read_u32_index(cfg_np, "qcom,tcs-config",
+						 i * 2, &type);
+		if (ret)
+			return ret;
+
+		ret = of_property_read_u32_index(cfg_np, "qcom,tcs-config",
+						 i * 2 + 1, &cnt);
+		if (ret)
+			return ret;
+
+		if (cnt > MAX_TCS_PER_TYPE) {
+			dev_err(&pdev->dev,
+				"%pOF: TCS type %u wants %u TCS > MAX_TCS_PER_TYPE=%d\n",
+				cfg_np, type, cnt, MAX_TCS_PER_TYPE);
 			return -EINVAL;
+		}
+
+		if (type > FAST_PATH_TCS ||
+		    (type == FAST_PATH_TCS && cnt > 1))
+			return -EINVAL;
+		tcs_cfg[j].type = type;
+		tcs_cfg[j].n = cnt;
+		j++;
+	}
+
+	for (i = 0; i < j; i++) {
+		if (drv->hw_channel && tcs_cfg[i].n &&
+		    tcs_cfg[i].type != WAKE_TCS && tcs_cfg[i].type != SLEEP_TCS)
+			return -EINVAL;
+		if (tcs_cfg[i].type == FAST_PATH_TCS) {
+			if (drv->hw_channel)
+				continue;
+			tcs = &drv->fast_tcs;
+		} else {
+			tcs = &groups[tcs_cfg[i].type];
+		}
+		if (tcs->drv) {
+			dev_err(&pdev->dev,
+				"%pOF: TCS type %u listed twice\n",
+				cfg_np, tcs_cfg[i].type);
+			return -EINVAL;
+		}
 		tcs->drv = drv;
 		tcs->type = tcs_cfg[i].type;
 		tcs->num_tcs = tcs_cfg[i].n;
@@ -1014,13 +1231,23 @@ static int rpmh_probe_tcs_config(struct platform_device *pdev, struct rsc_drv *d
 		if (!tcs->num_tcs || tcs->type == CONTROL_TCS)
 			continue;
 
-		if (st + tcs->num_tcs > max_tcs ||
-		    st + tcs->num_tcs >= BITS_PER_BYTE * sizeof(tcs->mask))
+		if (st - drv->num_tcs + tcs->num_tcs > max_tcs ||
+		    st + tcs->num_tcs >= BITS_PER_BYTE * sizeof(tcs->mask)) {
+			/* Reject TCS counts that exceed the hardware limit. */
+			dev_err(&pdev->dev,
+				"%pOF: TCS type %u n=%u does not fit: st=%d max_tcs=%u (config=0x%x ncpt=%u)\n",
+				cfg_np, tcs->type, tcs->num_tcs, st, max_tcs,
+				config, ncpt);
 			return -EINVAL;
+		}
 
 		tcs->mask = ((1 << tcs->num_tcs) - 1) << st;
 		tcs->offset = st;
 		st += tcs->num_tcs;
+	}
+	for (i = 0; i < TCS_TYPE_NR; i++) {
+		if (!groups[i].drv)
+			return -EINVAL;
 	}
 
 	drv->num_tcs = st;
@@ -1028,9 +1255,251 @@ static int rpmh_probe_tcs_config(struct platform_device *pdev, struct rsc_drv *d
 	return 0;
 }
 
+static int rpmh_probe_tcs_config(struct platform_device *pdev,
+				 struct device_node *drv_np, struct rsc_drv *drv)
+{
+	struct device_node *cfg_np __free(device_node) =
+		rpmh_tcs_config_node(pdev->dev.of_node, drv_np);
+
+	return rpmh_probe_channel_config(pdev, drv_np, drv, cfg_np, drv->tcs);
+}
+
+const struct device *rpmh_get_device(const char *name, u32 drv_id)
+{
+	struct rsc_drv *drv;
+	const struct device *dev = ERR_PTR(-ENODEV);
+
+	if (!name)
+		return ERR_PTR(-EINVAL);
+	mutex_lock(&rpmh_hw_drvs_lock);
+	list_for_each_entry(drv, &rpmh_hw_drvs, hw_list) {
+		if (drv->id == drv_id && !strcmp(drv->name, name)) {
+			dev = drv->dev;
+			break;
+		}
+	}
+	mutex_unlock(&rpmh_hw_drvs_lock);
+	return dev;
+}
+EXPORT_SYMBOL_GPL(rpmh_get_device);
+
+static int rpmh_hw_switch(struct rsc_drv *drv, unsigned int channel)
+{
+	u32 status;
+	int ret;
+
+	writel(BIT(channel), drv->base + RSC_HW_CHANNEL_UPDATE);
+	ret = readl_poll_timeout_atomic(drv->base + RSC_HW_TCS_COMPLETE,
+					status, status & BIT(channel * 2),
+					1, RSC_HW_TIMEOUT_US);
+	if (!ret)
+		writel(BIT(31), drv->base + RSC_HW_TCS_COMPLETE);
+	return ret;
+}
+
+static int rpmh_hw_get_channel(struct rsc_drv *drv)
+{
+	u32 busy, update;
+	int ret;
+
+	ret = readl_poll_timeout_atomic(drv->base + RSC_HW_CHANNEL_BUSY,
+		busy, (update = readl(drv->base + RSC_HW_CHANNEL_UPDATE),
+		       busy == update), 1, RSC_HW_TIMEOUT_US);
+	if (ret)
+		return ret;
+	if (busy == BIT(0))
+		return 1;
+	if (busy == BIT(1))
+		return 0;
+	return -EBUSY;
+}
+
+static int rpmh_hw_update(const struct device *dev, int enable)
+{
+	struct rsc_drv *drv;
+	unsigned long flags;
+	u32 enabled;
+	int channel, ret;
+
+	if (IS_ERR_OR_NULL(dev))
+		return -EINVAL;
+	drv = dev_get_drvdata(dev);
+	if (!drv || !drv->hw_channel)
+		return -EINVAL;
+
+	spin_lock_irqsave(&drv->lock, flags);
+	enabled = readl(drv->base + RSC_HW_CHANNEL_ENABLE);
+	if ((enable == 1 && enabled) || (enable != 1 && !enabled)) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	channel = enable == 1 ? 0 : rpmh_hw_get_channel(drv);
+	if (channel < 0) {
+		ret = channel;
+		goto unlock;
+	}
+	drv->channel = channel;
+	ret = rpmh_flush(&drv->client);
+	if (ret)
+		goto unlock;
+	if (enable == 1)
+		writel(1, drv->base + RSC_HW_CHANNEL_ENABLE);
+	ret = rpmh_hw_switch(drv, channel);
+	if (ret) {
+		if (enable == 1)
+			writel(0, drv->base + RSC_HW_CHANNEL_ENABLE);
+		goto unlock;
+	}
+	if (!enable) {
+		writel(0, drv->base + RSC_HW_CHANNEL_UPDATE);
+		writel(0, drv->base + RSC_HW_CHANNEL_ENABLE);
+	}
+
+unlock:
+	spin_unlock_irqrestore(&drv->lock, flags);
+	if (ret)
+		dev_err_ratelimited(dev, "RPMh HW channel operation=%d failed: %d\n",
+				    enable, ret);
+	return ret;
+}
+
+int rpmh_drv_start(const struct device *dev)
+{
+	return rpmh_hw_update(dev, 1);
+}
+EXPORT_SYMBOL_GPL(rpmh_drv_start);
+
+int rpmh_drv_stop(const struct device *dev)
+{
+	return rpmh_hw_update(dev, 0);
+}
+EXPORT_SYMBOL_GPL(rpmh_drv_stop);
+
+int rpmh_write_sleep_and_wake_no_child(const struct device *dev)
+{
+	return rpmh_hw_update(dev, -1);
+}
+EXPORT_SYMBOL_GPL(rpmh_write_sleep_and_wake_no_child);
+
+static void rpmh_hw_device_release(struct device *dev)
+{
+	of_node_put(dev->of_node);
+	kfree(dev);
+}
+
+static void rpmh_hw_device_unregister(void *data)
+{
+	struct rsc_drv *drv = data;
+
+	mutex_lock(&rpmh_hw_drvs_lock);
+	list_del_init(&drv->hw_list);
+	mutex_unlock(&rpmh_hw_drvs_lock);
+	of_platform_depopulate(drv->dev);
+	device_unregister(drv->dev);
+}
+
+static int rpmh_hw_probe(struct platform_device *pdev)
+{
+	struct device_node *dn = pdev->dev.of_node;
+	struct rsc_drv *drivers[3] = {};
+	u32 count;
+	unsigned long ids = 0;
+	int ret;
+
+	ret = of_property_read_u32(dn, "qcom,drv-count", &count);
+	if (ret || !count || count > 3)
+		return -EINVAL;
+
+	for_each_available_child_of_node_scoped(dn, np) {
+		struct rsc_drv *drv;
+		struct device *dev;
+		u32 id, rsc_id;
+		unsigned int channel = 0;
+		char resource[16];
+
+		if (!of_node_name_eq(np, "drv"))
+			continue;
+		ret = of_property_read_u32(np, "qcom,drv-id", &id);
+		if (ret || id >= count || test_and_set_bit(id, &ids))
+			return -EINVAL;
+		drv = devm_kzalloc(&pdev->dev, sizeof(*drv), GFP_KERNEL);
+		if (!drv)
+			return -ENOMEM;
+		drv->id = id;
+		drv->hw_channel = true;
+		drv->name = of_get_property(dn, "label", NULL);
+		if (!drv->name)
+			drv->name = dev_name(&pdev->dev);
+		snprintf(resource, sizeof(resource), "drv-%u", id);
+		drv->base = devm_platform_ioremap_resource_byname(pdev, resource);
+		if (IS_ERR(drv->base))
+			return PTR_ERR(drv->base);
+		rsc_id = readl_relaxed(drv->base + RSC_DRV_ID);
+		if (((rsc_id >> MAJOR_VER_SHIFT) & MAJOR_VER_MASK) < 3)
+			return -EOPNOTSUPP;
+		drv->regs = devm_kmemdup(&pdev->dev, rpmh_rsc_reg_offset_ver_3_0,
+					sizeof(rpmh_rsc_reg_offset_ver_3_0), GFP_KERNEL);
+		if (!drv->regs)
+			return -ENOMEM;
+		drv->regs[RSC_DRV_TCS_OFFSET] = 336;
+		for_each_available_child_of_node_scoped(np, cfg) {
+			if (!of_node_name_eq(cfg, "channel"))
+				continue;
+			if (channel >= 2)
+				return -EINVAL;
+			ret = rpmh_probe_channel_config(pdev, np, drv, cfg,
+						channel ? drv->hw_tcs : drv->tcs);
+			if (ret)
+				return ret;
+			channel++;
+		}
+		if (channel != 2 || !drv->tcs[WAKE_TCS].num_tcs ||
+		    !drv->hw_tcs[WAKE_TCS].num_tcs)
+			return -EINVAL;
+		spin_lock_init(&drv->lock);
+		spin_lock_init(&drv->client.cache_lock);
+		INIT_LIST_HEAD(&drv->client.cache);
+		INIT_LIST_HEAD(&drv->client.batch_cache);
+		INIT_LIST_HEAD(&drv->hw_list);
+		dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+		if (!dev)
+			return -ENOMEM;
+		dev->parent = &pdev->dev;
+		dev->of_node = of_node_get(np);
+		dev->release = rpmh_hw_device_release;
+		dev_set_name(dev, "%s:drv%u", dev_name(&pdev->dev), id);
+		dev_set_drvdata(dev, drv);
+		drv->dev = dev;
+		ret = device_register(dev);
+		if (ret) {
+			put_device(dev);
+			return ret;
+		}
+		ret = devm_add_action_or_reset(&pdev->dev,
+					     rpmh_hw_device_unregister, drv);
+		if (ret)
+			return ret;
+		writel(0, drv->tcs_base + drv->regs[RSC_DRV_IRQ_ENABLE]);
+		ret = of_platform_populate(np, NULL, NULL, dev);
+		if (ret)
+			return ret;
+		drivers[id] = drv;
+		dev_dbg(&pdev->dev, "RPMh HW %s drv=%u channels=%u TCS=%d ready\n",
+			 drv->name, id, channel, drv->num_tcs);
+	}
+	if (hweight_long(ids) != count)
+		return -EINVAL;
+	mutex_lock(&rpmh_hw_drvs_lock);
+	for (u32 id = 0; id < count; id++)
+		list_add_tail(&drivers[id]->hw_list, &rpmh_hw_drvs);
+	mutex_unlock(&rpmh_hw_drvs_lock);
+	return 0;
+}
+
 static int rpmh_rsc_probe(struct platform_device *pdev)
 {
 	struct device_node *dn = pdev->dev.of_node;
+	struct device_node *drv_np __free(device_node) = NULL;
 	struct rsc_drv *drv;
 	char drv_id[10] = {0};
 	int ret, irq;
@@ -1046,22 +1515,36 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, ret,
 				     "Command DB not available\n");
 
+	if (of_property_present(dn, "qcom,hw-channel"))
+		return rpmh_hw_probe(pdev);
+
 	drv = devm_kzalloc(&pdev->dev, sizeof(*drv), GFP_KERNEL);
 	if (!drv)
 		return -ENOMEM;
 
-	ret = of_property_read_u32(dn, "qcom,drv-id", &drv->id);
-	if (ret)
+	drv_np = rpmh_find_drv_child(dn);
+
+	ret = rpmh_read_drv_prop_u32(dn, drv_np, "qcom,drv-id", &drv->id);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"no qcom,drv-id on %pOF nor on a drv child\n", dn);
 		return ret;
+	}
 
 	drv->name = of_get_property(dn, "label", NULL);
 	if (!drv->name)
 		drv->name = dev_name(&pdev->dev);
 
+	/* Hardware channels accept sleep and wake requests only. */
+	drv->hw_channel = of_property_present(dn, "qcom,hw-channel");
+
 	snprintf(drv_id, ARRAY_SIZE(drv_id), "drv-%d", drv->id);
 	drv->base = devm_platform_ioremap_resource_byname(pdev, drv_id);
-	if (IS_ERR(drv->base))
+	if (IS_ERR(drv->base)) {
+		dev_err(&pdev->dev, "failed to map '%s': %ld\n", drv_id,
+			PTR_ERR(drv->base));
 		return PTR_ERR(drv->base);
+	}
 
 	rsc_id = readl_relaxed(drv->base + RSC_DRV_ID);
 	drv->ver.major = rsc_id & (MAJOR_VER_MASK << MAJOR_VER_SHIFT);
@@ -1074,7 +1557,7 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 	else
 		drv->regs = rpmh_rsc_reg_offset_ver_2_7;
 
-	ret = rpmh_probe_tcs_config(pdev, drv);
+	ret = rpmh_probe_tcs_config(pdev, drv_np, drv);
 	if (ret)
 		return ret;
 
@@ -1083,14 +1566,18 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 	bitmap_zero(drv->tcs_in_use, MAX_TCS_NR);
 
 	irq = platform_get_irq(pdev, drv->id);
-	if (irq < 0)
+	if (irq < 0) {
+		dev_err(&pdev->dev, "no irq for drv %d: %d\n", drv->id, irq);
 		return irq;
+	}
 
 	ret = devm_request_irq(&pdev->dev, irq, tcs_tx_done,
 			       IRQF_TRIGGER_HIGH | IRQF_NO_SUSPEND,
 			       drv->name, drv);
-	if (ret)
+	if (ret) {
+		dev_err(&pdev->dev, "failed to request irq %d: %d\n", irq, ret);
 		return ret;
+	}
 
 	/*
 	 * CPU PM/genpd notification are not required for controllers that support
@@ -1103,8 +1590,11 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 	if (!solver_config) {
 		if (pdev->dev.pm_domain) {
 			ret = rpmh_rsc_pd_attach(drv, &pdev->dev);
-			if (ret)
+			if (ret) {
+				dev_err(&pdev->dev,
+					"failed to attach genpd notifier: %d\n", ret);
 				return ret;
+			}
 		} else {
 			drv->rsc_pm.notifier_call = rpmh_rsc_cpu_pm_callback;
 			cpu_pm_register_notifier(&drv->rsc_pm);
@@ -1127,8 +1617,30 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 		dev_pm_genpd_remove_notifier(&pdev->dev);
 		pm_runtime_disable(&pdev->dev);
 	}
+	if (ret)
+		return ret;
 
-	return ret;
+	/*
+	 * Populate consumers below vendor drv nodes, which have no
+	 * compatible property and are skipped by strict platform
+	 * population.
+	 */
+	for_each_child_of_node_scoped(dn, child) {
+		if (!of_node_name_eq(child, "drv"))
+			continue;
+
+		ret = of_platform_populate(child, NULL, NULL, &pdev->dev);
+		if (ret) {
+			dev_err(&pdev->dev,
+				"failed to populate %pOF children: %d\n", child, ret);
+			return ret;
+		}
+	}
+
+	dev_dbg(&pdev->dev, "rpmh %s: drv %d up, %u TCS configured\n",
+		 drv->name, drv->id, drv->num_tcs);
+
+	return 0;
 }
 
 static const struct of_device_id rpmh_drv_match[] = {
