@@ -257,10 +257,10 @@ int __printf(2, 3) qmp_send(struct qmp *qmp, const char *fmt, ...)
 	readl(qmp->msgram + qmp->offset);
 	qmp_kick(qmp);
 
-	time_left = wait_event_interruptible_timeout(qmp->event,
-						     qmp_message_empty(qmp), HZ);
+	time_left = wait_event_timeout(qmp->event,
+				       qmp_message_empty(qmp), HZ);
 	if (!time_left) {
-		dev_err(qmp->dev, "ucore did not ack channel\n");
+		dev_err(qmp->dev, "ucore did not ack channel: %s\n", buf);
 		ret = -ETIMEDOUT;
 
 		/* Clear message from buffer */

@@ -28,6 +28,10 @@ struct qcom_ssr_notify_data {
 
 void *qcom_register_ssr_notifier(const char *name, struct notifier_block *nb);
 int qcom_unregister_ssr_notifier(void *notify, struct notifier_block *nb);
+/* KPORT: vendor glink subdev uses the early-SSR chain (implemented in the
+ * vendor rproc_qcom_common module). */
+void *qcom_register_early_ssr_notifier(const char *name, struct notifier_block *nb);
+int qcom_unregister_early_ssr_notifier(void *notify, struct notifier_block *nb);
 
 #else
 
@@ -43,6 +47,23 @@ static inline int qcom_unregister_ssr_notifier(void *notify,
 	return 0;
 }
 
+static inline void *qcom_register_early_ssr_notifier(const char *name,
+						struct notifier_block *nb)
+{
+	return NULL;
+}
+
+static inline int qcom_unregister_early_ssr_notifier(void *notify,
+						struct notifier_block *nb)
+{
+	return 0;
+}
+
 #endif
+
+
+/* Allow the vendor ADSP loader to select DTB firmware at runtime. */
+struct rproc;
+int qcom_rproc_set_dtb_firmware(struct rproc *rproc, const char *dtb_fw_name);
 
 #endif

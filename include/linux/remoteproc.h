@@ -696,6 +696,8 @@ void rproc_coredump_cleanup(struct rproc *rproc);
 void rproc_coredump(struct rproc *rproc);
 void rproc_coredump_using_sections(struct rproc *rproc);
 int rproc_coredump_add_segment(struct rproc *rproc, dma_addr_t da, size_t size);
+void qcom_rproc_update_recovery_status(struct rproc *rproc, bool enable);
+
 int rproc_coredump_add_custom_segment(struct rproc *rproc,
 				      dma_addr_t da, size_t size,
 				      void (*dumpfn)(struct rproc *rproc,

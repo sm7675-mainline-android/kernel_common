@@ -48,6 +48,8 @@ struct qcom_sysmon {
 
 	struct qmi_handle qmi;
 	struct sockaddr_qrtr ssctl;
+
+	uint32_t transaction_id;
 };
 
 enum {
@@ -543,6 +545,11 @@ static void sysmon_stop(struct rproc_subdev *subdev, bool crashed)
 
 	mutex_lock(&sysmon->state_lock);
 	sysmon->state = SSCTL_SSR_EVENT_BEFORE_SHUTDOWN;
+
+	sysmon->transaction_id++;
+	dev_dbg(sysmon->dev, "transaction ID for %s is %u\n",
+		 sysmon->name, sysmon->transaction_id);
+
 	blocking_notifier_call_chain(&sysmon_notifiers, 0, (void *)&event);
 	mutex_unlock(&sysmon->state_lock);
 
@@ -735,6 +742,12 @@ bool qcom_sysmon_shutdown_acked(struct qcom_sysmon *sysmon)
 	return sysmon && sysmon->shutdown_acked;
 }
 EXPORT_SYMBOL_GPL(qcom_sysmon_shutdown_acked);
+
+uint32_t qcom_sysmon_get_txn_id(struct qcom_sysmon *sysmon)
+{
+	return sysmon->transaction_id;
+}
+EXPORT_SYMBOL(qcom_sysmon_get_txn_id);
 
 /**
  * sysmon_probe() - probe sys_mon channel

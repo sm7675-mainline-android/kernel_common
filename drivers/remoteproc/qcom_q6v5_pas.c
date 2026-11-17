@@ -119,7 +119,40 @@ struct qcom_pas {
 
 	struct qcom_scm_pas_metadata pas_metadata;
 	struct qcom_scm_pas_metadata dtb_pas_metadata;
+
+	/* saved recovery_disabled state for kernel-client recovery toggles */
+	bool recovery_disabled_backup;
 };
+
+/**
+ * qcom_rproc_update_recovery_status() - enable/disable recovery from a kernel client
+ * @rproc:	remoteproc handle
+ * @enable:	true to enable recovery, false to restore the previous state
+ *
+ * Vendor clients (adsp_sleepmon) use this to keep the DSP alive while it is
+ * being monitored. The 6.1 vendor driver kept a private copy of the flag in
+ * the ADSP private data; the upstream struct is qcom_pas, so mirror that here.
+ */
+void qcom_rproc_update_recovery_status(struct rproc *rproc, bool enable)
+{
+	struct qcom_pas *pas;
+
+	if (!rproc)
+		return;
+
+	pas = rproc->priv;
+	mutex_lock(&rproc->lock);
+	if (enable) {
+		pas->recovery_disabled_backup = rproc->recovery_disabled;
+		rproc->recovery_disabled = false;
+		dev_dbg(pas->dev, "recovery enabled by kernel client\n");
+	} else {
+		rproc->recovery_disabled = pas->recovery_disabled_backup;
+		dev_dbg(pas->dev, "recovery state restored by kernel client\n");
+	}
+	mutex_unlock(&rproc->lock);
+}
+EXPORT_SYMBOL(qcom_rproc_update_recovery_status);
 
 static void qcom_pas_segment_dump(struct rproc *rproc,
 				  struct rproc_dump_segment *segment,
@@ -675,6 +708,56 @@ static void qcom_pas_unassign_memory_region(struct qcom_pas *pas)
 			dev_err(pas->dev, "unassign memory %d failed\n", offset);
 	}
 }
+
+
+int qcom_rproc_set_dtb_firmware(struct rproc *rproc, const char *dtb_fw_name);
+
+/* Allow the vendor ADSP loader to change DTB firmware only while offline. */
+int qcom_rproc_set_dtb_firmware(struct rproc *rproc, const char *dtb_fw_name)
+{
+	struct qcom_pas *pas;
+	struct device *dev;
+	int ret, len;
+	char *p;
+
+	if (!rproc || !dtb_fw_name)
+		return -EINVAL;
+
+	dev = rproc->dev.parent;
+	pas = rproc->priv;
+	ret = mutex_lock_interruptible(&rproc->lock);
+	if (ret)
+		return -EINVAL;
+
+	if (rproc->state != RPROC_OFFLINE) {
+		dev_err(dev, "can't change firmware while running\n");
+		ret = -EBUSY;
+		goto out;
+	}
+
+	len = strcspn(dtb_fw_name, "\n");
+	if (!len) {
+		dev_err(dev, "can't provide empty string for DTB firmware name\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	p = kstrndup(dtb_fw_name, len, GFP_KERNEL);
+	if (!p) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	if (pas->dtb_firmware_name)
+		kfree_const(pas->dtb_firmware_name);
+	pas->dtb_firmware_name = p;
+	ret = 0;
+
+out:
+	mutex_unlock(&rproc->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_rproc_set_dtb_firmware);
 
 static int qcom_pas_probe(struct platform_device *pdev)
 {
