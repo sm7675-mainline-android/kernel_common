@@ -556,6 +556,47 @@ int fscrypt_ioctl_set_policy(struct file *filp, const void __user *arg)
 	} else if (ret == -EINVAL ||
 		   (ret == 0 && !fscrypt_policies_equal(&policy,
 							&existing_policy))) {
+		if (ret == 0) {
+			u8 old_contents, old_filenames, old_flags, old_dus = 0;
+			u8 new_contents, new_filenames, new_flags, new_dus = 0;
+			bool key_spec_diff;
+
+			if (existing_policy.version == FSCRYPT_POLICY_V2) {
+				old_contents = existing_policy.v2.contents_encryption_mode;
+				old_filenames = existing_policy.v2.filenames_encryption_mode;
+				old_flags = existing_policy.v2.flags;
+				old_dus = existing_policy.v2.log2_data_unit_size;
+			} else {
+				old_contents = existing_policy.v1.contents_encryption_mode;
+				old_filenames = existing_policy.v1.filenames_encryption_mode;
+				old_flags = existing_policy.v1.flags;
+			}
+			if (policy.version == FSCRYPT_POLICY_V2) {
+				new_contents = policy.v2.contents_encryption_mode;
+				new_filenames = policy.v2.filenames_encryption_mode;
+				new_flags = policy.v2.flags;
+				new_dus = policy.v2.log2_data_unit_size;
+			} else {
+				new_contents = policy.v1.contents_encryption_mode;
+				new_filenames = policy.v1.filenames_encryption_mode;
+				new_flags = policy.v1.flags;
+			}
+			key_spec_diff = existing_policy.version != policy.version;
+			if (!key_spec_diff && policy.version == FSCRYPT_POLICY_V2)
+				key_spec_diff = memcmp(existing_policy.v2.master_key_identifier,
+						       policy.v2.master_key_identifier,
+						       FSCRYPT_KEY_IDENTIFIER_SIZE);
+			else if (!key_spec_diff)
+				key_spec_diff = memcmp(existing_policy.v1.master_key_descriptor,
+						       policy.v1.master_key_descriptor,
+						       FSCRYPT_KEY_DESCRIPTOR_SIZE);
+
+			pr_err_ratelimited("fscrypt: policy conflict ino=%lu old=v%u/%u,%u flags=%#x dus=%u new=v%u/%u,%u flags=%#x dus=%u key_spec_diff=%u\n",
+				   inode->i_ino, existing_policy.version,
+				   old_contents, old_filenames, old_flags, old_dus,
+				   policy.version, new_contents, new_filenames,
+				   new_flags, new_dus, key_spec_diff);
+		}
 		/* The file already uses a different encryption policy. */
 		ret = -EEXIST;
 	}
