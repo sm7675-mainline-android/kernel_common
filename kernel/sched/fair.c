@@ -782,6 +782,7 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
 
 	return cfs_rq->zero_vruntime;
 }
+EXPORT_SYMBOL_GPL(avg_vruntime);
 
 static inline u64 cfs_rq_max_slice(struct cfs_rq *cfs_rq);
 
@@ -8344,6 +8345,7 @@ unsigned long cpu_util_cfs(int cpu)
 {
 	return cpu_util(cpu, NULL, -1, 0);
 }
+EXPORT_SYMBOL_GPL(cpu_util_cfs);
 
 unsigned long cpu_util_cfs_boost(int cpu)
 {

@@ -292,6 +292,10 @@ DECLARE_HOOK(android_vh_irqtime_account_process_tick,
 	TP_PROTO(struct task_struct *p, struct rq *rq, int user_tick, int ticks),
 	TP_ARGS(p, rq, user_tick, ticks));
 
+DECLARE_HOOK(android_vh_account_process_tick_gran,
+	TP_PROTO(int user_tick, int *ticks),
+	TP_ARGS(user_tick, ticks));
+
 DECLARE_HOOK(android_vh_copy_process,
 	TP_PROTO(struct task_struct *p, int nr_threads),
 	TP_ARGS(p, nr_threads));
