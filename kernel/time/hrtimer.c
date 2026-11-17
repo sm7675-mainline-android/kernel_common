@@ -1649,10 +1649,12 @@ static void __hrtimer_setup(struct hrtimer *timer,
 	timer->base = &cpu_base->clock_base[base];
 	timerqueue_init(&timer->node);
 
-	if (WARN_ON_ONCE(!function))
-		ACCESS_PRIVATE(timer, function) = hrtimer_dummy_timeout;
-	else
-		ACCESS_PRIVATE(timer, function) = function;
+	/*
+	 * Legacy hrtimer_init() callers install the callback after
+	 * initialization. Keep a dummy callback until the driver assigns
+	 * its handler.
+	 */
+	ACCESS_PRIVATE(timer, function) = function ? : hrtimer_dummy_timeout;
 }
 
 /**

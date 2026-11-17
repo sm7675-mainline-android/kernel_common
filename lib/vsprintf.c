@@ -2216,6 +2216,8 @@ char *device_node_string(char *buf, char *end, struct device_node *dn,
 			break;
 		case 'n':	/* name */
 			p = fwnode_get_name(of_fwnode_handle(dn));
+			if (!p)
+				p = "(null)";
 			precision = str_spec.precision;
 			str_spec.precision = strchrnul(p, '@') - p;
 			buf = string(buf, end, p, str_spec);
@@ -2226,7 +2228,9 @@ char *device_node_string(char *buf, char *end, struct device_node *dn,
 			break;
 		case 'P':	/* path-spec */
 			p = fwnode_get_name(of_fwnode_handle(dn));
-			if (!p[1])
+			if (!p)
+				p = "(null)";
+			else if (!p[1])
 				p = "/";
 			buf = string(buf, end, p, str_spec);
 			break;
