@@ -796,6 +796,7 @@ err_retries:
 static int dma_buf_mmap_internal(struct file *file, struct vm_area_struct *vma)
 {
 	struct dma_buf *dmabuf;
+	bool ignore_bounds = false;
 	int ret;
 
 	if (!is_dma_buf_file(file))
@@ -807,9 +808,11 @@ static int dma_buf_mmap_internal(struct file *file, struct vm_area_struct *vma)
 	if (!dmabuf->ops->mmap)
 		return -EINVAL;
 
+	trace_android_vh_ignore_dmabuf_vmap_bounds(dmabuf, &ignore_bounds);
+
 	/* check for overflowing the buffer's size */
-	if (vma->vm_pgoff + vma_pages(vma) >
-	    dmabuf->size >> PAGE_SHIFT)
+	if ((vma->vm_pgoff + vma_pages(vma) >
+	    dmabuf->size >> PAGE_SHIFT) && !ignore_bounds)
 		return -EINVAL;
 
 	ret = dmabuf->ops->mmap(dmabuf, vma);

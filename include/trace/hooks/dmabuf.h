@@ -23,6 +23,13 @@ struct dma_buf;
 DECLARE_HOOK(android_vh_dma_buf_release,
 		TP_PROTO(struct dma_buf *data),
 		TP_ARGS(data));
+
+/* OPlus/QCOM exporters such as the UBWCP heap map buffers that are larger
+ * than dma_buf::size in their non-linear mode; they need to opt out of the
+ * generic bounds check in dma_buf_mmap_internal(). */
+DECLARE_HOOK(android_vh_ignore_dmabuf_vmap_bounds,
+		TP_PROTO(struct dma_buf *dmabuf, bool *ignore_bounds),
+		TP_ARGS(dmabuf, ignore_bounds));
 DECLARE_HOOK(android_vh_dma_heap_buffer_alloc_lat_start,
 	TP_PROTO(unsigned long long *stime),
 	TP_ARGS(stime));
