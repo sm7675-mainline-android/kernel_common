@@ -8,6 +8,11 @@
 
 #include <linux/types.h>
 
+struct device;
+struct dev_pm_ops;
+struct rpmsg_device;
+struct rpmsg_endpoint;
+
 #define GLINK_FEATURE_INTENT_REUSE	BIT(0)
 #define GLINK_FEATURE_MIGRATION		BIT(1)
 #define GLINK_FEATURE_TRACER_PKT	BIT(2)
@@ -27,7 +32,6 @@ struct qcom_glink_pipe {
 	void (*kick)(struct qcom_glink_pipe *glink_pipe);
 };
 
-struct device;
 struct qcom_glink;
 
 struct qcom_glink *qcom_glink_native_probe(struct device *dev,
@@ -37,5 +41,16 @@ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
 					   bool intentless);
 void qcom_glink_native_remove(struct qcom_glink *glink);
 void qcom_glink_native_rx(struct qcom_glink *glink);
+
+extern const struct dev_pm_ops glink_native_pm_ops;
+int qcom_glink_native_start(struct qcom_glink *glink);
+void qcom_glink_native_unregister(struct qcom_glink *glink);
+
+int qcom_glink_get_signals(struct rpmsg_endpoint *ept);
+int qcom_glink_set_signals(struct rpmsg_endpoint *ept, u32 set, u32 clear);
+int qcom_glink_register_signals_cb(struct rpmsg_endpoint *ept,
+	int (*signals_cb)(struct rpmsg_device *dev, void *priv, u32 old, u32 new));
+bool qcom_glink_rx_done_supported(struct rpmsg_endpoint *ept);
+int qcom_glink_rx_done(struct rpmsg_endpoint *ept, void *data);
 
 #endif
