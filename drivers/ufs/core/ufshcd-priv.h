@@ -9,6 +9,18 @@
 struct ufs_hba_priv {
 	struct ufs_hba hba;
 	bool zwor_sup;
+	spinlock_t diag_lock;
+	struct delayed_work diag_work;
+	DECLARE_BITMAP(diag_pending, 256);
+	ktime_t diag_issued[256];
+	u8 diag_opcode[256];
+	u64 diag_sent;
+	u64 diag_completed;
+	u64 diag_last_completed;
+	unsigned long diag_last_report;
+	unsigned long diag_last_h8;
+	bool diag_stalled;
+	bool diag_h8_verbose;
 };
 
 static inline struct ufs_hba_priv *to_hba_priv(struct ufs_hba *hba)

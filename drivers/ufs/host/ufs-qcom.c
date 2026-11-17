@@ -7,6 +7,7 @@
 #include <linux/clk.h>
 #include <linux/cleanup.h>
 #include <linux/delay.h>
+#include <linux/timer.h>
 #include <linux/devfreq.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interconnect.h>
@@ -59,6 +60,10 @@ enum {
 
 #define QCOM_UFS_MAX_GEAR 5
 #define QCOM_UFS_MAX_LANE 2
+
+static bool diag_verbose;
+module_param(diag_verbose, bool, 0400);
+MODULE_PARM_DESC(diag_verbose, "Enable extra UFS host diagnostics at initialization");
 
 enum {
 	MODE_MIN,
@@ -172,6 +177,7 @@ static int ufs_qcom_ice_init(struct ufs_qcom_host *host)
 	struct qcom_ice *ice;
 	union ufs_crypto_capabilities caps;
 	union ufs_crypto_cap_entry cap;
+	int cap_idx = -1;
 	int err;
 	int i;
 
@@ -211,10 +217,19 @@ static int ufs_qcom_ice_init(struct ufs_qcom_host *host)
 						       REG_UFS_CRYPTOCAP +
 						       i * sizeof(__le32)));
 		if (cap.algorithm_id == UFS_CRYPTO_ALG_AES_XTS &&
-		    cap.key_size == UFS_CRYPTO_KEY_SIZE_256)
+		    cap.key_size == UFS_CRYPTO_KEY_SIZE_256) {
 			profile->modes_supported[BLK_ENCRYPTION_MODE_AES_256_XTS] |=
 				cap.sdus_mask * 512;
+			/*
+			 * Use the AES-XTS-256 capability index when
+			 * programming ICE CRYPTOCFG.
+			 */
+			if (cap_idx < 0)
+				cap_idx = i;
+		}
 	}
+	if (cap_idx >= 0)
+		qcom_ice_set_cap_idx(ice, cap_idx);
 
 	hba->caps |= UFSHCD_CAP_CRYPTO;
 	hba->quirks |= UFSHCD_QUIRK_CUSTOM_CRYPTO_PROFILE;
@@ -735,6 +750,12 @@ static int ufs_qcom_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op,
 	if (status == PRE_CHANGE)
 		return 0;
 
+	/* Trace runtime and system power transitions. */
+	dev_dbg(hba->dev,
+		 "PM suspend %s: link_active=%d link_off=%d\n",
+		 pm_op == UFS_SYSTEM_PM ? "system" : "runtime",
+		 ufs_qcom_is_link_active(hba), ufs_qcom_is_link_off(hba));
+
 	if (!ufs_qcom_is_link_active(hba))
 		ufs_qcom_disable_lane_clks(host);
 
@@ -764,6 +785,10 @@ static int ufs_qcom_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
 	int err;
 	u32 reg_val;
+
+	dev_dbg(hba->dev, "PM resume %s: link_active=%d link_off=%d\n",
+		 pm_op == UFS_SYSTEM_PM ? "system" : "runtime",
+		 ufs_qcom_is_link_active(hba), ufs_qcom_is_link_off(hba));
 
 	err = ufs_qcom_enable_lane_clks(host);
 	if (err)
@@ -979,6 +1004,16 @@ static int ufs_qcom_pwr_change_notify(struct ufs_hba *hba,
 		/* cache the power mode parameters to use internally */
 		memcpy(&host->dev_req_params,
 				dev_req_params, sizeof(*dev_req_params));
+
+		/*
+		 * Report negotiated parameters without reprogramming the
+		 * PHY.
+		 */
+		dev_dbg(hba->dev,
+			 "pwr change: gear_tx=%u gear_rx=%u lane_tx=%u lane_rx=%u rate=%u\n",
+			 dev_req_params->gear_tx, dev_req_params->gear_rx,
+			 dev_req_params->lane_tx, dev_req_params->lane_rx,
+			 dev_req_params->hs_rate);
 
 		ufs_qcom_icc_update_bw(host);
 
@@ -1249,6 +1284,7 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 {
 	const struct ufs_qcom_drvdata *drvdata = of_device_get_match_data(hba->dev);
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+	struct device_node *np = hba->dev->of_node;
 
 	if (host->hw_ver.major == 0x2)
 		hba->quirks |= UFSHCD_QUIRK_BROKEN_UFS_HCI_VERSION;
@@ -1261,6 +1297,13 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 
 	if (drvdata && drvdata->quirks)
 		hba->quirks |= drvdata->quirks;
+
+	/* Honor vendor DT properties that mark automatic Hibern8 as broken. */
+	if (np && (of_property_read_bool(np, "qcom,broken-ahit-wa") ||
+		   of_property_read_bool(np, "qcom,disable-lpm"))) {
+		hba->quirks |= UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
+		dev_dbg(hba->dev, "automatic Hibern8 disabled by vendor DT quirk\n");
+	}
 }
 
 static void ufs_qcom_set_phy_gear(struct ufs_qcom_host *host)
@@ -1340,12 +1383,15 @@ static void ufs_qcom_set_caps(struct ufs_hba *hba)
 {
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
 
+	/*
+	 * Keep clock scaling and runtime autosuspend disabled to match
+	 * the vendor configuration and avoid unsupported START_STOP
+	 * transitions. System suspend remains available.
+	 */
 	hba->caps |= UFSHCD_CAP_CLK_GATING | UFSHCD_CAP_HIBERN8_WITH_CLK_GATING;
-	hba->caps |= UFSHCD_CAP_CLK_SCALING | UFSHCD_CAP_WB_WITH_CLK_SCALING;
 	hba->caps |= UFSHCD_CAP_AUTO_BKOPS_SUSPEND;
 	hba->caps |= UFSHCD_CAP_WB_EN;
 	hba->caps |= UFSHCD_CAP_AGGR_POWER_COLLAPSE;
-	hba->caps |= UFSHCD_CAP_RPM_AUTOSUSPEND;
 
 	if (host->hw_ver.major >= 0x7)
 		hba->caps |= UFSHCD_CAP_TX_EQUALIZATION;
@@ -1501,6 +1547,85 @@ static int ufs_qcom_icc_init(struct ufs_qcom_host *host)
  * Return: -EPROBE_DEFER if binding fails, returns negative error
  * on phy power up failure and returns zero on success.
  */
+/* Optional UFS state sampling, enabled only by diag_verbose. */
+/* With hb_ms unset, report state changes at the default polling interval. */
+static unsigned int ufs_qcom_hb_ms;
+module_param_named(hb_ms, ufs_qcom_hb_ms, uint, 0644);
+MODULE_PARM_DESC(hb_ms, "UFS state heartbeat interval in ms (0 = only on state change)");
+
+#define UFS_QCOM_HB_POLL_MS	1000
+#define UFS_QCOM_HB_STOP_SECS	1800
+#define UFS_QCOM_HB_KEYN	8
+
+static struct ufs_qcom_host *ufs_qcom_hb_host;
+static struct timer_list ufs_qcom_hb_timer;
+static long ufs_qcom_hb_last[UFS_QCOM_HB_KEYN] = {
+	-1, -1, -1, -1, -1, -1, -1, -1,
+};
+
+static unsigned int ufs_qcom_hb_interval(void)
+{
+	return ufs_qcom_hb_ms ? ufs_qcom_hb_ms : UFS_QCOM_HB_POLL_MS;
+}
+
+static void ufs_qcom_hb_tick(struct timer_list *t)
+{
+	struct ufs_qcom_host *qh = READ_ONCE(ufs_qcom_hb_host);
+	struct ufs_hba *hba;
+
+	long key[UFS_QCOM_HB_KEYN];
+	int i, changed = 0;
+
+	if (!READ_ONCE(diag_verbose) || !qh)
+		return;
+	hba = qh->hba;
+	if (!hba || !hba->host)
+		goto rearm;
+
+	key[0] = hba->ufshcd_state;
+	key[1] = hba->uic_link_state;
+	key[2] = hba->curr_dev_pwr_mode;
+	key[3] = hba->pwr_info.gear_tx;
+	key[4] = hba->pwr_info.lane_tx;
+	key[5] = (long)hba->errors ^ ((long)hba->saved_err << 8);
+	key[6] = (long)hba->uic_error;
+	key[7] = hba->max_pwr_info.is_valid;
+
+	for (i = 0; i < UFS_QCOM_HB_KEYN; i++) {
+		if (key[i] != ufs_qcom_hb_last[i]) {
+			changed = 1;
+			ufs_qcom_hb_last[i] = key[i];
+		}
+	}
+	if (!changed && !ufs_qcom_hb_ms)
+		goto rearm;
+
+	/*
+	 * Include negotiated power mode, maximum gear validity and
+	 * interrupt mode.
+	 */
+	dev_info(hba->dev,
+		 "ufs_hb: t=%llus (change) state=%d link=%d dev=%d gear_tx=%d lane_tx=%d err=0x%x saved=0x%x uic=0x%x out=%u "
+		 "gear_rx=%d lane_rx=%d pwr=%d/%d rate=%d max=%d esi=%d cg=%d sys=%d hgear=%d phy=%d\n",
+		 (unsigned long long)ktime_get_boottime_seconds(), hba->ufshcd_state, hba->uic_link_state,
+		 hba->curr_dev_pwr_mode, hba->pwr_info.gear_tx,
+		 hba->pwr_info.lane_tx, (unsigned int)hba->errors,
+		 (unsigned int)hba->saved_err, (unsigned int)hba->uic_error,
+		 (unsigned int)hweight_long(hba->outstanding_reqs),
+		 hba->pwr_info.gear_rx, hba->pwr_info.lane_rx,
+		 hba->pwr_info.pwr_tx, hba->pwr_info.pwr_rx,
+		 hba->pwr_info.hs_rate,
+		 hba->max_pwr_info.is_valid ? 1 : 0,
+		 hba->mcq_esi_enabled ? 1 : 0,
+		 hba->clk_gating.is_suspended ? 1 : 0,
+		 hba->is_sys_suspended ? 1 : 0,
+		 qh->host_params.hs_tx_gear, qh->phy_gear);
+
+rearm:
+	if (ktime_get_boottime_seconds() < UFS_QCOM_HB_STOP_SECS)
+		mod_timer(t, jiffies + msecs_to_jiffies(ufs_qcom_hb_interval()));
+}
+
 static int ufs_qcom_init(struct ufs_hba *hba)
 {
 	int err;
@@ -1591,6 +1716,13 @@ static int ufs_qcom_init(struct ufs_hba *hba)
 	if (drvdata && drvdata->no_phy_retention)
 		hba->spm_lvl = UFS_PM_LVL_5;
 
+	/* Initialize optional UFS state diagnostics. */
+	WRITE_ONCE(ufs_qcom_hb_host, host);
+	timer_setup(&ufs_qcom_hb_timer, ufs_qcom_hb_tick, 0);
+	if (READ_ONCE(diag_verbose))
+		mod_timer(&ufs_qcom_hb_timer,
+			  jiffies + msecs_to_jiffies(ufs_qcom_hb_interval()));
+
 	return 0;
 
 out_variant_clear:
@@ -1603,6 +1735,8 @@ static void ufs_qcom_exit(struct ufs_hba *hba)
 {
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
 
+	WRITE_ONCE(ufs_qcom_hb_host, NULL);
+	timer_delete_sync(&ufs_qcom_hb_timer);
 	ufs_qcom_disable_lane_clks(host);
 	phy_power_off(host->generic_phy);
 	phy_exit(host->generic_phy);
@@ -2004,7 +2138,8 @@ static int ufs_qcom_dump_regs(struct ufs_hba *hba, size_t offset, size_t len,
 static void ufs_qcom_dump_mcq_hci_regs(struct ufs_hba *hba)
 {
 	struct ufshcd_mcq_opr_info_t *opr = &hba->mcq_opr[0];
-	void __iomem *mcq_vs_base = hba->mcq_base + UFS_MEM_VS_BASE;
+	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+	void __iomem *mcq_vs_base = host->mcq_vs_base;
 
 	struct dump_info {
 		void __iomem *base;
@@ -2016,7 +2151,7 @@ static void ufs_qcom_dump_mcq_hci_regs(struct ufs_hba *hba)
 	struct dump_info mcq_dumps[] = {
 		{hba->mcq_base, 0x0, 256 * 4, "MCQ HCI-0 "},
 		{hba->mcq_base, 0x400, 256 * 4, "MCQ HCI-1 "},
-		{mcq_vs_base, 0x0, 5 * 4, "MCQ VS-0 "},
+		{mcq_vs_base, 0x0, 4 * 4, "MCQ VS-0 "},
 		{opr->base, 0x0, 256 * 4, "MCQ SQD-0 "},
 		{opr->base, 0x400, 256 * 4, "MCQ SQD-1 "},
 		{opr->base, 0x800, 256 * 4, "MCQ SQD-2 "},
@@ -2029,6 +2164,8 @@ static void ufs_qcom_dump_mcq_hci_regs(struct ufs_hba *hba)
 	};
 
 	for (int i = 0; i < ARRAY_SIZE(mcq_dumps); i++) {
+		if (!mcq_dumps[i].base)
+			continue;
 		ufs_qcom_dump_regs(hba, mcq_dumps[i].offset, mcq_dumps[i].len,
 				   mcq_dumps[i].prefix, mcq_dumps[i].base);
 		cond_resched();
@@ -2154,15 +2291,44 @@ static void ufs_qcom_config_scaling_param(struct ufs_hba *hba,
 static int ufs_qcom_mcq_config_resource(struct ufs_hba *hba)
 {
 	struct platform_device *pdev = to_platform_device(hba->dev);
-	struct resource *res;
+	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+	struct resource *res, *mem_res, *mcq;
+	resource_size_t start;
 
 	/* Map the MCQ configuration region */
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mcq");
-	if (!res) {
+	if (res)
+		goto map;
+
+	/*
+	 * Derive the MCQ configuration resource from ufs_mem for vendor
+	 * bindings that provide only the separate mcq_sqd and mcq_vs
+	 * windows.
+	 */
+	mem_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "ufs_mem");
+	if (!mem_res) {
 		dev_err(hba->dev, "MCQ resource not found in device tree\n");
 		return -ENODEV;
 	}
 
+	start = mem_res->start + MCQ_SQATTR_OFFSET(hba->mcq_capabilities);
+
+	mcq = devm_kzalloc(hba->dev, sizeof(*mcq), GFP_KERNEL);
+	if (!mcq)
+		return -ENOMEM;
+
+	mcq->start = start;
+	mcq->end = start + hba->nr_hw_queues * MCQ_QCFG_SIZE - 1;
+	mcq->flags = mem_res->flags;
+	mcq->name = "mcq";
+	res = mcq;
+
+	dev_dbg(hba->dev,
+		 "MCQ resource not in DT, derived 0x%llx-0x%llx (%u queues)\n",
+		 (unsigned long long)mcq->start, (unsigned long long)mcq->end,
+		 hba->nr_hw_queues);
+
+map:
 	hba->mcq_base = devm_ioremap_resource(hba->dev, res);
 	if (IS_ERR(hba->mcq_base)) {
 		dev_err(hba->dev, "Failed to map MCQ region: %ld\n",
@@ -2170,12 +2336,38 @@ static int ufs_qcom_mcq_config_resource(struct ufs_hba *hba)
 		return PTR_ERR(hba->mcq_base);
 	}
 
+	/*
+	 * Map mcq_vs separately because it lies outside the derived MCQ
+	 * configuration resource.
+	 */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mcq_vs");
+	if (res) {
+		host->mcq_vs_base = devm_ioremap_resource(hba->dev, res);
+		if (IS_ERR(host->mcq_vs_base)) {
+			dev_err(hba->dev, "Failed to map mcq_vs: %ld\n",
+				PTR_ERR(host->mcq_vs_base));
+			host->mcq_vs_base = NULL;
+		} else {
+			dev_dbg(hba->dev,
+				 "MCQ VS mapped from mcq_vs %pa (size 0x%llx)\n",
+				 &res->start,
+				 (unsigned long long)resource_size(res));
+		}
+	} else {
+		dev_warn(hba->dev,
+			 "no mcq_vs resource; CQIS_VS reads fall back to mcq_base+0x%x\n",
+			 UFS_MEM_CQIS_VS);
+	}
+
 	return 0;
 }
 
 static int ufs_qcom_op_runtime_config(struct ufs_hba *hba)
 {
+	struct platform_device *pdev = to_platform_device(hba->dev);
 	struct ufshcd_mcq_opr_info_t *opr;
+	struct resource *sqd_res;
+	void __iomem *sqd_base = NULL;
 	int i;
 	u32 doorbell_offsets[OPR_MAX];
 
@@ -2197,22 +2389,38 @@ static int ufs_qcom_op_runtime_config(struct ufs_hba *hba)
 	doorbell_offsets[OPR_CQIS] = UFS_QCOM_CQIS_ADDR_OFFSET;
 
 	/*
-	 * Configure MCQ operation registers.
-	 *
-	 * The doorbell registers are physically located within the MCQ region:
-	 * - doorbell_physical_addr = mmio_base + doorbell_offset
-	 * - doorbell_physical_addr = mcq_base + (doorbell_offset - MCQ_CONFIG_OFFSET)
+	 * Map doorbells through mcq_sqd; the derived MCQ configuration
+	 * window does not cover the operational registers.
 	 */
+	sqd_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mcq_sqd");
+	if (sqd_res) {
+		sqd_base = devm_ioremap_resource(hba->dev, sqd_res);
+		if (IS_ERR(sqd_base)) {
+			dev_err(hba->dev, "Failed to map mcq_sqd: %ld\n",
+				PTR_ERR(sqd_base));
+			return PTR_ERR(sqd_base);
+		}
+		dev_dbg(hba->dev,
+			 "MCQ doorbells mapped from mcq_sqd %pa (size 0x%llx), stride 0x%x\n",
+			 &sqd_res->start,
+			 (unsigned long long)resource_size(sqd_res),
+			 UFS_QCOM_MCQ_STRIDE);
+	} else {
+		dev_warn(hba->dev,
+			 "no mcq_sqd resource, doorbells = mcq_base + 0x%lx\n",
+			 (unsigned long)UFS_QCOM_MCQ_SQD_OFFSET);
+	}
+
 	for (i = 0; i < OPR_MAX; i++) {
 		opr = &hba->mcq_opr[i];
 		opr->offset = doorbell_offsets[i];  /* Offset relative to mmio_base */
 		opr->stride = UFS_QCOM_MCQ_STRIDE;  /* 256 bytes between queues */
 
-		/*
-		 * Calculate the actual doorbell base address within MCQ region:
-		 * base = mcq_base + (doorbell_offset - MCQ_CONFIG_OFFSET)
-		 */
-		opr->base = hba->mcq_base + (opr->offset - UFS_QCOM_MCQ_CONFIG_OFFSET);
+		if (sqd_base)
+			opr->base = sqd_base + 0x40 * i;
+		else
+			opr->base = hba->mcq_base +
+				    (opr->offset - UFS_QCOM_MCQ_CONFIG_OFFSET);
 	}
 
 	return 0;
@@ -2227,8 +2435,16 @@ static int ufs_qcom_get_hba_mac(struct ufs_hba *hba)
 static int ufs_qcom_get_outstanding_cqs(struct ufs_hba *hba,
 					unsigned long *ocqs)
 {
-	/* Read from MCQ vendor-specific register in MCQ region */
-	*ocqs = readl(hba->mcq_base + UFS_MEM_CQIS_VS);
+	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+
+	/*
+	 * Return an error without mcq_vs so the caller polls all completion
+	 * queues.
+	 */
+	if (!host->mcq_vs_base)
+		return -ENODEV;
+
+	*ocqs = readl(host->mcq_vs_base + (UFS_MEM_CQIS_VS - UFS_MEM_VS_BASE));
 
 	return 0;
 }

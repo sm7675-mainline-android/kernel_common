@@ -342,9 +342,16 @@ unsigned long ufshcd_mcq_poll_cqe_lock(struct ufs_hba *hba,
 {
 	unsigned long completed_reqs = 0;
 	unsigned long flags;
+	u32 tail;
 
 	spin_lock_irqsave(&hwq->cq_lock, flags);
-	ufshcd_mcq_update_cq_tail_slot(hwq);
+	tail = readl(hwq->mcq_cq_tail);
+	hwq->cq_tail_slot = tail / sizeof(struct cq_entry);
+	if (tail % sizeof(struct cq_entry) || hwq->cq_tail_slot >= hwq->max_entries)
+		dev_err_ratelimited(hba->dev,
+			"MCQ DIAG invalid CQ before poll q=%u raw_tail=%#x sw_head=%u depth=%u task=%s/%d\n",
+			hwq->id, tail, hwq->cq_head_slot, hwq->max_entries,
+			current->comm, current->pid);
 	while (!ufshcd_mcq_is_cq_empty(hwq)) {
 		ufshcd_mcq_process_cqe(hba, hwq);
 		ufshcd_mcq_inc_cq_head_slot(hwq);
@@ -632,26 +639,43 @@ static void ufshcd_mcq_nullify_sqe(struct utp_transfer_req_desc *utrd)
  * @hwq: Hardware Queue to be searched.
  * @task_tag: The command's task tag.
  *
- * Return: true if the SQE containing the command is present in the SQ
- * (not fetched by the controller); returns false if the SQE is not in the SQ.
+ * Return: 1 if the command is present in the SQ, 0 if absent, or a negative
+ * error if the queue cannot be stopped, validated or restarted.
  */
-static bool ufshcd_mcq_sqe_search(struct ufs_hba *hba,
+static int ufshcd_mcq_sqe_search(struct ufs_hba *hba,
 				  struct ufs_hw_queue *hwq, int task_tag)
 {
 	struct ufshcd_lrb *lrbp = &hba->lrb[task_tag];
 	struct utp_transfer_req_desc *utrd;
 	__le64  cmd_desc_base_addr;
-	bool ret = false;
+	int ret = 0, err;
 	u64 addr, match;
-	u32 sq_head_slot;
+	u32 sq_head_slot, sq_head;
 
 	if (hba->quirks & UFSHCD_QUIRK_MCQ_BROKEN_RTC)
 		return true;
 
 	mutex_lock(&hwq->sq_mutex);
 
-	ufshcd_mcq_sq_stop(hba, hwq);
-	sq_head_slot = ufshcd_mcq_get_sq_head_slot(hwq);
+	ret = ufshcd_mcq_sq_stop(hba, hwq);
+	if (ret) {
+		dev_err(hba->dev,
+			"MCQ DIAG SQ stop failed hwq=%u tag=%d head=%#x tail=%u depth=%u rc=%d\n",
+			hwq->id, task_tag, readl(hwq->mcq_sq_head),
+			hwq->sq_tail_slot, hwq->max_entries, ret);
+		goto unlock;
+	}
+	sq_head = readl(hwq->mcq_sq_head);
+	sq_head_slot = sq_head / sizeof(*utrd);
+	if (sq_head % sizeof(*utrd) || sq_head_slot >= hwq->max_entries ||
+	    hwq->sq_tail_slot >= hwq->max_entries) {
+		dev_err(hba->dev,
+			"MCQ DIAG invalid SQ hwq=%u tag=%d head=%#x tail=%u depth=%u\n",
+			hwq->id, task_tag, sq_head, hwq->sq_tail_slot,
+			hwq->max_entries);
+		ret = -EINVAL;
+		goto out;
+	}
 	if (sq_head_slot == hwq->sq_tail_slot)
 		goto out;
 
@@ -673,7 +697,10 @@ static bool ufshcd_mcq_sqe_search(struct ufs_hba *hba,
 	}
 
 out:
-	ufshcd_mcq_sq_start(hba, hwq);
+	err = ufshcd_mcq_sq_start(hba, hwq);
+	if (err)
+		ret = err;
+unlock:
 	mutex_unlock(&hwq->sq_mutex);
 	return ret;
 }
@@ -707,7 +734,25 @@ int ufshcd_mcq_abort(struct scsi_cmnd *cmd)
 		return FAILED;
 	}
 
-	if (ufshcd_mcq_sqe_search(hba, hwq, tag)) {
+	dev_dbg(hba->dev,
+		"MCQ DIAG abort hwq=%u tag=%d sq=%#x/%#x sw_tail=%u depth=%u cq=%#x/%#x\n",
+		hwq->id, tag, readl(hwq->mcq_sq_head),
+		readl(hwq->mcq_sq_tail), hwq->sq_tail_slot, hwq->max_entries,
+		readl(hwq->mcq_cq_head), readl(hwq->mcq_cq_tail));
+	dev_dbg(hba->dev,
+		"MCQ DIAG controller is=%#x ie=%#x hcs=%#x esi=%d state=%d link=%d sqdao=%#x cqdao=%#x\n",
+		ufshcd_readl(hba, REG_INTERRUPT_STATUS),
+		ufshcd_readl(hba, REG_INTERRUPT_ENABLE),
+		ufshcd_readl(hba, REG_CONTROLLER_STATUS), hba->mcq_esi_enabled,
+		hba->ufshcd_state, hba->uic_link_state,
+		ufsmcq_readl(hba, ufshcd_mcq_cfg_offset(REG_SQDAO, hwq->id)),
+		ufsmcq_readl(hba, ufshcd_mcq_cfg_offset(REG_CQDAO, hwq->id)));
+	err = ufshcd_mcq_sqe_search(hba, hwq, tag);
+	if (err < 0) {
+		lrbp->req_abort_skip = true;
+		return FAILED;
+	}
+	if (err) {
 		/*
 		 * Failure. The command should not be "stuck" in SQ for
 		 * a long time which resulted in command being aborted.

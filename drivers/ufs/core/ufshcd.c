@@ -112,6 +112,10 @@ enum {
 
 /* UFSHC 4.0 compliant HC support this mode. */
 static bool use_mcq_mode = true;
+static bool diag_verbose;
+
+module_param(diag_verbose, bool, 0400);
+MODULE_PARM_DESC(diag_verbose, "Enable extra UFS diagnostics at initialization");
 
 static bool is_mcq_supported(struct ufs_hba *hba)
 {
@@ -467,7 +471,7 @@ static void ufshcd_add_uic_command_trace(struct ufs_hba *hba,
 
 	trace_android_vh_ufs_send_uic_command(hba, ucmd, (int)str_t);
 
-	if (!trace_ufshcd_uic_command_enabled())
+	if (!READ_ONCE(diag_verbose) && !trace_ufshcd_uic_command_enabled())
 		return;
 
 	if (str_t == UFS_CMD_SEND) {
@@ -481,6 +485,14 @@ static void ufshcd_add_uic_command_trace(struct ufs_hba *hba,
 		arg2 = ufshcd_readl(hba, REG_UIC_COMMAND_ARG_2);
 		arg3 = ufshcd_readl(hba, REG_UIC_COMMAND_ARG_3);
 	}
+
+	if (unlikely(READ_ONCE(diag_verbose)))
+		dev_info(hba->dev, "uic %s cmd=0x%x arg1=0x%08x arg2=0x%08x arg3=0x%08x\n",
+			 str_t == UFS_CMD_SEND ? "send" : "compl",
+			 cmd, arg1, arg2, arg3);
+
+	if (!trace_ufshcd_uic_command_enabled())
+		return;
 
 	trace_ufshcd_uic_command(hba, str_t, cmd, arg1, arg2, arg3);
 }
@@ -2390,7 +2402,19 @@ void ufshcd_send_command(struct ufs_hba *hba, unsigned int task_tag,
 			 struct ufs_hw_queue *hwq)
 {
 	struct ufshcd_lrb *lrbp = &hba->lrb[task_tag];
+	struct ufs_hba_priv *priv = to_hba_priv(hba);
 	unsigned long flags;
+
+	if (unlikely(READ_ONCE(diag_verbose))) {
+		spin_lock_irqsave(&priv->diag_lock, flags);
+		priv->diag_sent++;
+		if (task_tag < ARRAY_SIZE(priv->diag_issued)) {
+			priv->diag_issued[task_tag] = ktime_get();
+			priv->diag_opcode[task_tag] = lrbp->cmd ? lrbp->cmd->cmnd[0] : 0;
+			__set_bit(task_tag, priv->diag_pending);
+		}
+		spin_unlock_irqrestore(&priv->diag_lock, flags);
+	}
 
 	if (hba->monitor.enabled) {
 		lrbp->issue_time_stamp = ktime_get();
@@ -2607,6 +2631,53 @@ ufshcd_dispatch_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
 }
 
 /**
+ * ufshcd_dump_uic_diag - dump UFSHCI state when a UIC command times out
+ * @hba: per adapter instance
+ * @where: caller tag for the log line
+ * @uic_cmd: the command that timed out (may be NULL)
+ *
+ * A UIC command timeout is ambiguous: either the controller never signals
+ * UIC_COMMAND_COMPL, or the completion interrupt never reaches the CPU.
+ * Reading IS/IE/HCS plus the five UIC error-code registers tells the two
+ * apart without any extra boot parameter:
+ *
+ *  - IS has UIC_COMMAND_COMPL but the command never completed  => IRQ lost
+ *  - IS clear and HCS.DP clear                                  => link/PHY
+ *  - any UEC* register non-zero                                 => decode UIC err
+ */
+static void ufshcd_dump_uic_diag(struct ufs_hba *hba, const char *where,
+				 struct uic_command *uic_cmd)
+{
+	u32 is = ufshcd_readl(hba, REG_INTERRUPT_STATUS);
+	u32 ie = ufshcd_readl(hba, REG_INTERRUPT_ENABLE);
+	u32 hcs = ufshcd_readl(hba, REG_CONTROLLER_STATUS);
+	u32 arg2 = ufshcd_readl(hba, REG_UIC_COMMAND_ARG_2);
+	u32 pa = ufshcd_readl(hba, REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER);
+	u32 dl = ufshcd_readl(hba, REG_UIC_ERROR_CODE_DATA_LINK_LAYER);
+	u32 nl = ufshcd_readl(hba, REG_UIC_ERROR_CODE_NETWORK_LAYER);
+	u32 tl = ufshcd_readl(hba, REG_UIC_ERROR_CODE_TRANSPORT_LAYER);
+	u32 dme = ufshcd_readl(hba, REG_UIC_ERROR_CODE_DME);
+
+	dev_err(hba->dev,
+		"%s: UIC diag: IS=0x%08x IE=0x%08x HCS=0x%08x ARG2=0x%08x (dev_present=%u uic_ready=%u utp_ready=%u uccs=%u)\n",
+		where, is, ie, hcs, arg2,
+		!!(hcs & DEVICE_PRESENT), !!(hcs & UIC_COMMAND_READY),
+		!!(hcs & UTP_TRANSFER_REQ_LIST_READY),
+		!!(is & UIC_COMMAND_COMPL));
+	dev_err(hba->dev,
+		"%s: UIC err regs: PA=0x%08x DL=0x%08x NL=0x%08x TL=0x%08x DME=0x%08x\n",
+		where, pa, dl, nl, tl, dme);
+	dev_err(hba->dev,
+		"%s: uic cmd=0x%x arg1=0x%08x arg3=0x%08x active=%d pwr_info pwr_tx=%d pwr_rx=%d gear_tx=%d lane_tx=%d\n",
+		where, uic_cmd ? uic_cmd->command : 0,
+		uic_cmd ? uic_cmd->argument1 : 0,
+		uic_cmd ? uic_cmd->argument3 : 0,
+		uic_cmd ? uic_cmd->cmd_active : 0,
+		hba->pwr_info.pwr_tx, hba->pwr_info.pwr_rx,
+		hba->pwr_info.gear_tx, hba->pwr_info.lane_tx);
+}
+
+/**
  * ufshcd_wait_for_uic_cmd - Wait for completion of an UIC command
  * @hba: per adapter instance
  * @uic_cmd: UIC command
@@ -2629,6 +2700,8 @@ ufshcd_wait_for_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
 		dev_err(hba->dev,
 			"uic cmd 0x%x with arg3 0x%x completion timeout\n",
 			uic_cmd->command, uic_cmd->argument3);
+		if (READ_ONCE(diag_verbose))
+			ufshcd_dump_uic_diag(hba, "uic-timeout", uic_cmd);
 
 		if (!uic_cmd->cmd_active) {
 			dev_err(hba->dev, "%s: UIC cmd has been completed, return the result\n",
@@ -3282,6 +3355,44 @@ ufshcd_dev_cmd_completion(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
  * Return: 0 upon success; > 0 in case the UFS device reported an OCS error;
  * < 0 if another error occurred.
  */
+/*
+ * Snapshot controller state on device command timeout, at most once every
+ * five seconds.
+ */
+static void ufshcd_dump_dev_cmd_timeout(struct ufs_hba *hba,
+					struct ufshcd_lrb *lrbp)
+{
+	static unsigned long last;
+	u32 isr, ier, hcs, hcs2;
+
+	if (!READ_ONCE(diag_verbose))
+		return;
+
+	if (time_before(jiffies, last + 5 * HZ))
+		return;
+	last = jiffies;
+
+	isr = ufshcd_readl(hba, REG_INTERRUPT_STATUS);
+	ier = ufshcd_readl(hba, REG_INTERRUPT_ENABLE);
+	hcs = ufshcd_readl(hba, REG_CONTROLLER_STATUS);
+	hcs2 = ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_RUN_STOP);
+
+	dev_err(hba->dev,
+		"ufs_diag: dev_cmd TIMEOUT tag=%d type=%#x state=%d link=%d "
+		"is=0x%08x ie=0x%08x hcs=0x%08x utrlrs=0x%08x utrldbr=0x%08x "
+		"utmrdbr=0x%08x out=0x%lx mcq=%d esi=%d cg=%d sys=%d\n",
+		lrbp->task_tag, lrbp->command_type, hba->ufshcd_state,
+		hba->uic_link_state, isr, ier, hcs, hcs2,
+		ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL),
+		ufshcd_readl(hba, REG_UTP_TASK_REQ_DOOR_BELL),
+		hba->outstanding_reqs, hba->mcq_enabled,
+		hba->mcq_esi_enabled, hba->clk_gating.is_suspended,
+		hba->is_sys_suspended);
+
+	ufshcd_dump_regs(hba, 0, UFSHCI_REG_SPACE_SIZE, "ufs_diag regs: ");
+	ufshcd_print_pwr_info(hba);
+}
+
 static int ufshcd_wait_for_dev_cmd(struct ufs_hba *hba,
 		struct ufshcd_lrb *lrbp, int max_timeout)
 {
@@ -3302,6 +3413,7 @@ retry:
 		err = -ETIMEDOUT;
 		dev_dbg(hba->dev, "%s: dev_cmd request timedout, tag %d\n",
 			__func__, lrbp->task_tag);
+		ufshcd_dump_dev_cmd_timeout(hba, lrbp);
 
 		/* MCQ mode */
 		if (hba->mcq_enabled) {
@@ -4506,6 +4618,8 @@ static int ufshcd_uic_pwr_ctrl(struct ufs_hba *hba, struct uic_command *cmd)
 			"pwr ctrl cmd 0x%x with (MIBattribute 0x%x, mode 0x%x) completion timeout\n",
 			cmd->command, UIC_GET_ATTR_ID(cmd->argument1),
 			cmd->argument3);
+		if (READ_ONCE(diag_verbose))
+			ufshcd_dump_uic_diag(hba, "uic-pwr-timeout", cmd);
 
 		if (!cmd->cmd_active) {
 			dev_err(hba->dev, "%s: Power Mode Change operation has been completed, go check UPMCRS\n",
@@ -4661,14 +4775,173 @@ int ufshcd_link_recovery(struct ufs_hba *hba)
 }
 EXPORT_SYMBOL_GPL(ufshcd_link_recovery);
 
+static void ufshcd_diag_queues(struct ufs_hba *hba, const char *phase,
+			       bool powered)
+{
+	struct {
+		u32 sq_head, sq_tail, cq_head, cq_tail;
+		u32 sw_sq, sw_cq, depth, sqdao, cqdao, cqis, cqie;
+	} queues[16];
+	u32 intr, enable, status, ahit, mcqcap;
+	unsigned long flags = 0;
+	unsigned int count = 0, index;
+	bool locked = false;
+	int pm = 0;
+
+	if (!READ_ONCE(diag_verbose))
+		return;
+
+	if (!powered) {
+		pm = pm_runtime_get_if_in_use(hba->dev);
+		if (pm <= 0)
+			goto skipped;
+		if (down_trylock(&hba->host_sem))
+			goto put_pm;
+		if (!down_read_trylock(&hba->clk_scaling_lock))
+			goto put_host;
+		spin_lock_irqsave(&hba->clk_gating.lock, flags);
+		if (hba->pm_op_in_progress || hba->is_sys_suspended ||
+		    hba->ufshcd_state != UFSHCD_STATE_OPERATIONAL ||
+		    (hba->clk_gating.is_initialized &&
+		     hba->clk_gating.state != CLKS_ON)) {
+			spin_unlock_irqrestore(&hba->clk_gating.lock, flags);
+			goto put_scaling;
+		}
+		locked = true;
+	}
+	intr = ufshcd_readl(hba, REG_INTERRUPT_STATUS);
+	enable = ufshcd_readl(hba, REG_INTERRUPT_ENABLE);
+	status = ufshcd_readl(hba, REG_CONTROLLER_STATUS);
+	ahit = ufshcd_readl(hba, REG_AUTO_HIBERNATE_IDLE_TIMER);
+	mcqcap = ufshcd_readl(hba, REG_MCQCAP);
+	if (hba->mcq_enabled && hba->uhq) {
+		count = min_t(unsigned int, hba->nr_hw_queues, ARRAY_SIZE(queues));
+		for (index = 0; index < count; index++) {
+			struct ufs_hw_queue *hwq = &hba->uhq[index];
+
+			if (!hwq->mcq_sq_head || !hwq->mcq_sq_tail ||
+			    !hwq->mcq_cq_head || !hwq->mcq_cq_tail) {
+				count = index;
+				break;
+			}
+			queues[index].sq_head = readl(hwq->mcq_sq_head);
+			queues[index].sq_tail = readl(hwq->mcq_sq_tail);
+			queues[index].cq_head = readl(hwq->mcq_cq_head);
+			queues[index].cq_tail = readl(hwq->mcq_cq_tail);
+			queues[index].sw_sq = READ_ONCE(hwq->sq_tail_slot);
+			queues[index].sw_cq = READ_ONCE(hwq->cq_head_slot);
+			queues[index].depth = hwq->max_entries;
+			queues[index].sqdao = ufsmcq_readl(hba,
+				ufshcd_mcq_cfg_offset(REG_SQDAO, index));
+			queues[index].cqdao = ufsmcq_readl(hba,
+				ufshcd_mcq_cfg_offset(REG_CQDAO, index));
+			queues[index].cqis = ufshcd_mcq_read_cqis(hba, index);
+			queues[index].cqie = readl(hba->mcq_opr[OPR_CQIS].base +
+				hba->mcq_opr[OPR_CQIS].stride * index + REG_CQIE);
+		}
+	}
+	if (locked) {
+		spin_unlock_irqrestore(&hba->clk_gating.lock, flags);
+		up_read(&hba->clk_scaling_lock);
+		up(&hba->host_sem);
+		pm_runtime_put_noidle(hba->dev);
+	}
+	dev_info(hba->dev,
+		 "UFS DIAG %s is=%#x ie=%#x hcs=%#x ahit=%#x mcqcap=%#x state=%d link=%d cg=%d refs=%d pm=%d suspended=%d esi=%d queues=%u/%u\n",
+		 phase, intr, enable, status, ahit, mcqcap,
+		 READ_ONCE(hba->ufshcd_state), READ_ONCE(hba->uic_link_state),
+		 READ_ONCE(hba->clk_gating.state), READ_ONCE(hba->clk_gating.active_reqs),
+		 READ_ONCE(hba->pm_op_in_progress), READ_ONCE(hba->is_sys_suspended),
+		 hba->mcq_esi_enabled, count, hba->nr_hw_queues);
+	for (index = 0; index < count; index++)
+		dev_info(hba->dev,
+			 "UFS DIAG %s q=%u sq=%#x/%#x cq=%#x/%#x sw=%u/%u depth=%u dao=%#x/%#x cqis=%#x cqie=%#x\n",
+			 phase, index, queues[index].sq_head, queues[index].sq_tail,
+			 queues[index].cq_head, queues[index].cq_tail,
+			 queues[index].sw_sq, queues[index].sw_cq, queues[index].depth,
+			 queues[index].sqdao, queues[index].cqdao,
+			 queues[index].cqis, queues[index].cqie);
+	return;
+
+put_scaling:
+	up_read(&hba->clk_scaling_lock);
+put_host:
+	up(&hba->host_sem);
+put_pm:
+	pm_runtime_put_noidle(hba->dev);
+skipped:
+	dev_info(hba->dev,
+		 "UFS DIAG %s MMIO skipped rpm=%d state=%d link=%d cg=%d refs=%d pm=%d suspended=%d\n",
+		 phase, pm, READ_ONCE(hba->ufshcd_state), READ_ONCE(hba->uic_link_state),
+		 READ_ONCE(hba->clk_gating.state), READ_ONCE(hba->clk_gating.active_reqs),
+		 READ_ONCE(hba->pm_op_in_progress), READ_ONCE(hba->is_sys_suspended));
+}
+
+static void ufshcd_diag_work(struct work_struct *work)
+{
+	struct ufs_hba_priv *priv = container_of(to_delayed_work(work),
+						struct ufs_hba_priv, diag_work);
+	struct ufs_hba *hba = &priv->hba;
+	ktime_t now;
+	u64 sent, completed, delta;
+	s64 oldest_ms = 0, age;
+	unsigned long flags, tag;
+	unsigned int pending = 0, oldest_tag = 0, opcode = 0;
+	bool stalled;
+
+	if (!READ_ONCE(diag_verbose))
+		return;
+	now = ktime_get();
+
+	spin_lock_irqsave(&priv->diag_lock, flags);
+	sent = priv->diag_sent;
+	completed = priv->diag_completed;
+	for_each_set_bit(tag, priv->diag_pending, ARRAY_SIZE(priv->diag_issued)) {
+		pending++;
+		age = ktime_ms_delta(now, priv->diag_issued[tag]);
+		if (age > oldest_ms) {
+			oldest_ms = age;
+			oldest_tag = tag;
+			opcode = priv->diag_opcode[tag];
+		}
+	}
+	spin_unlock_irqrestore(&priv->diag_lock, flags);
+	delta = completed - priv->diag_last_completed;
+	priv->diag_last_completed = completed;
+	stalled = pending && oldest_ms >= 2000;
+	if (stalled != priv->diag_stalled ||
+	    ((stalled || READ_ONCE(diag_verbose)) &&
+	     time_after_eq(jiffies, priv->diag_last_report + (stalled ? 5 : 15) * HZ))) {
+		priv->diag_last_report = jiffies;
+		dev_info(hba->dev,
+			 "UFS DIAG progress sent=%llu done=%llu delta=%llu pending=%u oldest=%lldms tag=%u op=%#x stalled=%d h8_exit=%llu h8_count=%u\n",
+			 sent, completed, delta, pending, oldest_ms, oldest_tag, opcode,
+			 stalled, hba->ufs_stats.last_hibern8_exit_tstamp,
+			 hba->ufs_stats.hibern8_exit_cnt);
+		if (stalled)
+			ufshcd_diag_queues(hba, "stalled", false);
+	}
+	priv->diag_stalled = stalled;
+	if (!READ_ONCE(hba->shutting_down) && ktime_get_boottime_seconds() < 1800)
+		queue_delayed_work(system_unbound_wq, &priv->diag_work, HZ);
+}
+
 int ufshcd_uic_hibern8_enter(struct ufs_hba *hba)
 {
 	struct uic_command uic_cmd = {
 		.command = UIC_CMD_DME_HIBER_ENTER,
 	};
 	ktime_t start = ktime_get();
+	struct ufs_hba_priv *priv = to_hba_priv(hba);
 	int ret;
 
+	priv->diag_h8_verbose = READ_ONCE(diag_verbose) &&
+		ktime_get_boottime_seconds() >= 15 &&
+		time_after_eq(jiffies, priv->diag_last_h8 + 5 * HZ);
+	if (priv->diag_h8_verbose) {
+		priv->diag_last_h8 = jiffies;
+		ufshcd_diag_queues(hba, "h8-enter-pre", true);
+	}
 	ufshcd_vops_hibern8_notify(hba, UIC_CMD_DME_HIBER_ENTER, PRE_CHANGE);
 
 	ret = ufshcd_uic_pwr_ctrl(hba, &uic_cmd);
@@ -4682,6 +4955,11 @@ int ufshcd_uic_hibern8_enter(struct ufs_hba *hba)
 		ufshcd_vops_hibern8_notify(hba, UIC_CMD_DME_HIBER_ENTER,
 								POST_CHANGE);
 
+	if (READ_ONCE(diag_verbose) && (priv->diag_h8_verbose || ret)) {
+		dev_info(hba->dev, "UFS DIAG h8-enter rc=%d duration=%lldus\n",
+			 ret, ktime_us_delta(ktime_get(), start));
+		ufshcd_diag_queues(hba, "h8-enter-post", true);
+	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(ufshcd_uic_hibern8_enter);
@@ -4693,7 +4971,10 @@ int ufshcd_uic_hibern8_exit(struct ufs_hba *hba)
 	};
 	int ret;
 	ktime_t start = ktime_get();
+	struct ufs_hba_priv *priv = to_hba_priv(hba);
 
+	if (priv->diag_h8_verbose)
+		ufshcd_diag_queues(hba, "h8-exit-pre", true);
 	ufshcd_vops_hibern8_notify(hba, UIC_CMD_DME_HIBER_EXIT, PRE_CHANGE);
 
 	ret = ufshcd_uic_pwr_ctrl(hba, &uic_cmd);
@@ -4710,6 +4991,12 @@ int ufshcd_uic_hibern8_exit(struct ufs_hba *hba)
 		hba->ufs_stats.hibern8_exit_cnt++;
 	}
 
+	if (READ_ONCE(diag_verbose) && (priv->diag_h8_verbose || ret)) {
+		dev_info(hba->dev, "UFS DIAG h8-exit rc=%d duration=%lldus\n",
+			 ret, ktime_us_delta(ktime_get(), start));
+		ufshcd_diag_queues(hba, "h8-exit-post", true);
+	}
+	priv->diag_h8_verbose = false;
 	return ret;
 }
 EXPORT_SYMBOL_GPL(ufshcd_uic_hibern8_exit);
@@ -4833,6 +5120,11 @@ static int ufshcd_get_max_pwr_mode(struct ufs_hba *hba)
 	}
 
 	hba->max_pwr_info.is_valid = true;
+	dev_dbg(hba->dev,
+		 "max power mode: gear_rx=%d gear_tx=%d lane_rx=%d lane_tx=%d pwr_rx=%d pwr_tx=%d rate=%d\n",
+		 pwr_info->gear_rx, pwr_info->gear_tx,
+		 pwr_info->lane_rx, pwr_info->lane_tx,
+		 pwr_info->pwr_rx, pwr_info->pwr_tx, pwr_info->hs_rate);
 	return 0;
 }
 
@@ -5318,6 +5610,11 @@ link_startup:
 
 	if (ret) {
 		/* failed to get the link up... retire */
+		dev_err(hba->dev,
+			"%s: link startup failed, ret=%d, ufs_dev_active=%d\n",
+			__func__, ret, ufshcd_is_ufs_dev_active(hba));
+		if (READ_ONCE(diag_verbose))
+			ufshcd_dump_uic_diag(hba, "link-startup-fail", NULL);
 		ufshcd_update_evt_hist(hba,
 				       UFS_EVT_LINK_STARTUP_FAIL,
 				       (u32)ret);
@@ -5870,9 +6167,18 @@ void ufshcd_compl_one_cqe(struct ufs_hba *hba, int task_tag,
 			  struct cq_entry *cqe)
 {
 	struct ufshcd_lrb *lrbp;
+	struct ufs_hba_priv *priv = to_hba_priv(hba);
 	struct scsi_cmnd *cmd;
 	enum utp_ocs ocs;
+	unsigned long flags;
 
+	if (unlikely(READ_ONCE(diag_verbose))) {
+		spin_lock_irqsave(&priv->diag_lock, flags);
+		priv->diag_completed++;
+		if (task_tag >= 0 && task_tag < ARRAY_SIZE(priv->diag_issued))
+			__clear_bit(task_tag, priv->diag_pending);
+		spin_unlock_irqrestore(&priv->diag_lock, flags);
+	}
 	lrbp = &hba->lrb[task_tag];
 	if (hba->monitor.enabled) {
 		lrbp->compl_time_stamp = ktime_get();
@@ -7115,8 +7421,8 @@ static irqreturn_t ufshcd_update_uic_error(struct ufs_hba *hba)
 		 * must be checked but this error is handled separately.
 		 */
 		if (reg & UIC_PHY_ADAPTER_LAYER_LANE_ERR_MASK)
-			dev_dbg(hba->dev, "%s: UIC Lane error reported\n",
-					__func__);
+			dev_err(hba->dev, "%s: UIC Lane error reported, UECPA=0x%08x\n",
+					__func__, reg);
 
 		/* Got a LINERESET indication. */
 		if (reg & UIC_PHY_ADAPTER_LAYER_GENERIC_ERROR) {
@@ -7188,7 +7494,7 @@ static irqreturn_t ufshcd_update_uic_error(struct ufs_hba *hba)
 		retval |= IRQ_HANDLED;
 	}
 
-	dev_dbg(hba->dev, "%s: UIC error flags = 0x%08x\n",
+	dev_err(hba->dev, "%s: UIC error flags = 0x%08x\n",
 			__func__, hba->uic_error);
 	return retval;
 }
@@ -8020,6 +8326,7 @@ static int ufshcd_abort(struct scsi_cmnd *cmd)
 	 */
 	scsi_print_command(cmd);
 	if (!hba->req_abort_count) {
+		ufshcd_diag_queues(hba, "abort-pre-dump", true);
 		ufshcd_update_evt_hist(hba, UFS_EVT_ABORT, tag);
 		ufshcd_print_evt_hist(hba);
 		ufshcd_print_host_state(hba);
@@ -9058,11 +9365,20 @@ static int ufshcd_device_params_init(struct ufs_hba *hba)
 			QUERY_FLAG_IDN_PWR_ON_WPE, 0, &flag))
 		hba->dev_info.f_power_on_wp_en = flag;
 
-	/* Probe maximum power mode co-supported by both UFS host and device */
-	if (ufshcd_get_max_pwr_mode(hba))
+	/*
+	 * Retry maximum power mode discovery once after a transient UIC
+	 * failure so gear negotiation can proceed.
+	 */
+	if (ufshcd_get_max_pwr_mode(hba)) {
 		dev_err(hba->dev,
-			"%s: Failed getting max supported power mode\n",
+			"%s: Failed getting max supported power mode, retrying\n",
 			__func__);
+		msleep(20);
+		if (ufshcd_get_max_pwr_mode(hba))
+			dev_err(hba->dev,
+				"%s: still failed -- gear switch will be SKIPPED\n",
+				__func__);
+	}
 
 	ufshcd_retrieve_tx_eq_settings(hba);
 out:
@@ -9198,7 +9514,7 @@ static void ufshcd_config_mcq(struct ufs_hba *hba)
 	ufshcd_mcq_make_queues_operational(hba);
 	ufshcd_mcq_config_mac(hba, hba->nutrs);
 
-	dev_info(hba->dev, "MCQ configured, nr_queues=%d, io_queues=%d, read_queue=%d, poll_queues=%d, queue_depth=%d\n",
+	dev_dbg(hba->dev, "MCQ configured, nr_queues=%d, io_queues=%d, read_queue=%d, poll_queues=%d, queue_depth=%d\n",
 		 hba->nr_hw_queues, hba->nr_queues[HCTX_TYPE_DEFAULT],
 		 hba->nr_queues[HCTX_TYPE_READ], hba->nr_queues[HCTX_TYPE_POLL],
 		 hba->nutrs);
@@ -9222,8 +9538,18 @@ static int ufshcd_post_device_init(struct ufs_hba *hba)
 
 	ufshcd_set_timestamp_attr(hba);
 
-	if (!hba->max_pwr_info.is_valid)
+	if (!hba->max_pwr_info.is_valid) {
+		/*
+		 * Report missing maximum power parameters instead of
+		 * silently retaining the initial gear and lane
+		 * configuration.
+		 */
+		dev_err(hba->dev,
+			"%s: max_pwr_info invalid -- SKIPPING power mode change, link stays at gear=%d lane=%d pwr=%d/%d\n",
+			__func__, hba->pwr_info.gear_tx, hba->pwr_info.lane_tx,
+			hba->pwr_info.pwr_tx, hba->pwr_info.pwr_rx);
 		return 0;
+	}
 
 	/*
 	 * Set the right value to bRefClkFreq before attempting to
@@ -10715,6 +11041,7 @@ static void ufshcd_wl_shutdown(struct device *dev)
  */
 void ufshcd_remove(struct ufs_hba *hba)
 {
+	cancel_delayed_work_sync(&to_hba_priv(hba)->diag_work);
 	if (hba->ufs_device_wlun)
 		ufshcd_rpm_get_sync(hba);
 	ufs_hwmon_remove(hba);
@@ -10854,6 +11181,10 @@ int ufshcd_alloc_host(struct device *dev, struct ufs_hba **hba_handle)
 	ufshcd_set_sg_entry_size(hba, sizeof(struct ufshcd_sg_entry));
 	INIT_LIST_HEAD(&hba->clk_list_head);
 	spin_lock_init(&hba->outstanding_lock);
+	spin_lock_init(&to_hba_priv(hba)->diag_lock);
+	to_hba_priv(hba)->diag_last_report = jiffies;
+	to_hba_priv(hba)->diag_last_h8 = jiffies;
+	INIT_DELAYED_WORK(&to_hba_priv(hba)->diag_work, ufshcd_diag_work);
 
 	*hba_handle = hba;
 
@@ -11193,6 +11524,8 @@ initialized:
 
 	device_enable_async_suspend(dev);
 	ufshcd_pm_qos_init(hba);
+	if (READ_ONCE(diag_verbose))
+		queue_delayed_work(system_unbound_wq, &to_hba_priv(hba)->diag_work, HZ);
 	return 0;
 
 out_disable:

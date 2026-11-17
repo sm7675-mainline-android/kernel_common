@@ -349,6 +349,12 @@ struct ufs_qcom_host {
 
 	bool esi_enabled;
 
+	/*
+	 * Separate vendor-specific MCQ register window, outside the derived
+	 * MCQ configuration resource.
+	 */
+	void __iomem *mcq_vs_base;
+
 	u32 saved_tx_eq_g1_setting;
 };
 
