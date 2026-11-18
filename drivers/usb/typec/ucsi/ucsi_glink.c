@@ -6,16 +6,32 @@
 #include <linux/auxiliary_bus.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/property.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/usb/typec_mux.h>
+#include <linux/usb/ucsi_glink.h>
 #include <linux/gpio/consumer.h>
 #include <linux/soc/qcom/pmic_glink.h>
 #include "ucsi.h"
 
 #define PMIC_GLINK_MAX_PORTS		3
+
+static BLOCKING_NOTIFIER_HEAD(ucsi_glink_notifier);
+
+int register_ucsi_glink_notifier(struct notifier_block *notifier)
+{
+	return blocking_notifier_chain_register(&ucsi_glink_notifier, notifier);
+}
+EXPORT_SYMBOL_GPL(register_ucsi_glink_notifier);
+
+int unregister_ucsi_glink_notifier(struct notifier_block *notifier)
+{
+	return blocking_notifier_chain_unregister(&ucsi_glink_notifier, notifier);
+}
+EXPORT_SYMBOL_GPL(unregister_ucsi_glink_notifier);
 
 #define UCSI_BUF_SIZE                   48
 
@@ -184,7 +200,20 @@ static void pmic_glink_ucsi_update_connector(struct ucsi_connector *con)
 static void pmic_glink_ucsi_connector_status(struct ucsi_connector *con)
 {
 	struct pmic_glink_ucsi *ucsi = ucsi_get_drvdata(con->ucsi);
+	struct ucsi_glink_constat_info info = { .acc = TYPEC_ACCESSORY_NONE };
 	int orientation;
+
+	if (UCSI_CONSTAT(con, CONNECTED)) {
+		switch (UCSI_CONSTAT(con, PARTNER_TYPE)) {
+		case UCSI_CONSTAT_PARTNER_TYPE_AUDIO:
+			info.acc = TYPEC_ACCESSORY_AUDIO;
+			break;
+		case UCSI_CONSTAT_PARTNER_TYPE_DEBUG:
+			info.acc = TYPEC_ACCESSORY_DEBUG;
+			break;
+		}
+	}
+	blocking_notifier_call_chain(&ucsi_glink_notifier, con->num, &info);
 
 	if (!UCSI_CONSTAT(con, CONNECTED)) {
 		typec_set_orientation(con->port, TYPEC_ORIENTATION_NONE);
