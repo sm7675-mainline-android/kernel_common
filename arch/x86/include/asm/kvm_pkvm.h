@@ -130,8 +130,9 @@ struct alloc_domain_data {
 	u16 gaw;
 	u8 agaw;
 	u8 iommu_superpage;
-	u8 iommu_coherency;
-	u8 use_first_level;
+	u8 iommu_coherency: 1;
+	u8 use_first_level: 1;
+	u8 pkvm_nested: 1;
 };
 
 struct domain_map_data {
@@ -225,6 +226,7 @@ union pkvm_hc_data {
 #define HOST_INIT_MMU				2
 #define HOST_RESET_MMU				3
 #define HOST_APF_READY				4
+#define HOST_TRIPLE_FAULT			5
 	} vcpu_run;
 #ifdef CONFIG_PKVM_INTEL
 	struct {

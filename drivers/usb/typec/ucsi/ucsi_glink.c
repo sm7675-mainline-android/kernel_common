@@ -310,6 +310,10 @@ static void pmic_glink_ucsi_destroy(void *data)
 {
 	struct pmic_glink_ucsi *ucsi = data;
 
+	/* Drain the work items before ucsi_destroy() frees the ucsi instance */
+	cancel_work_sync(&ucsi->notify_work);
+	cancel_work_sync(&ucsi->register_work);
+
 	/* Protect to make sure we're not in a middle of a transaction from a glink callback */
 	mutex_lock(&ucsi->lock);
 	ucsi_destroy(ucsi->ucsi);
@@ -420,10 +424,15 @@ static void pmic_glink_ucsi_remove(struct auxiliary_device *adev)
 	struct pmic_glink_ucsi *ucsi = dev_get_drvdata(&adev->dev);
 
 	pmic_glink_client_unregister(ucsi->client);
-	cancel_work_sync(&ucsi->register_work);
-	cancel_work_sync(&ucsi->notify_work);
-	if (ucsi->ucsi_registered)
+	/* Callbacks can queue work until devres releases the client */
+	disable_work_sync(&ucsi->notify_work);
+	disable_work_sync(&ucsi->register_work);
+
+	/* register_work may have unregistered the instance already */
+	if (ucsi->ucsi_registered) {
+		ucsi->ucsi_registered = false;
 		ucsi_unregister(ucsi->ucsi);
+	}
 }
 
 static const struct auxiliary_device_id pmic_glink_ucsi_id_table[] = {

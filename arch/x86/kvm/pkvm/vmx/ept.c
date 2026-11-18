@@ -6,7 +6,6 @@
 #include <mmu/spte.h>
 #include <vmx/vmx.h>
 #include <vmx/vmx_ops.h>
-#include "debug.h"
 #include "ept.h"
 #include "gfp.h"
 #include "pkvm/mmu.h"
@@ -329,6 +328,7 @@ int pkvm_host_ept_init(struct pkvm_pgtable *pgt, void *pool_base,
 		.allowed_pgsz = 1 << PG_LEVEL_4K,
 		.table_prot = VMX_EPT_RWX_MASK,
 		.flush_tlb_lazy = true,
+		.coalesce_on_map = true,
 	};
 	int ret;
 
@@ -454,79 +454,15 @@ static void handle_host_ept_violation_failure(struct kvm_vcpu *vcpu)
 	fault.address = vmcs_readl(GUEST_LINEAR_ADDRESS);
 	fault.exit_qualification = exit_qualification;
 
-	kvm_inject_page_fault(vcpu, &fault);
+	kvm_inject_page_fault(vcpu, &fault, false);
 }
 
 void pkvm_handle_host_ept_violation(struct kvm_vcpu *vcpu)
 {
-	struct range range, cur;
-	int level, ret = -EPERM;
-	unsigned long hpa, gpa;
+	unsigned long gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
 
-	BUG_ON(!host_ept);
-
-	gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
-	/*
-	 * All the memory and MMIO holes have already been mapped in the host
-	 * EPT when initialize, except for the MMIO in the high-end address.
-	 * Handle the MMIO only.
-	 */
-	if (pkvm_find_addr_range(gpa, &range) || is_pvmfw(gpa) ||
-	    is_iommu_mmio(gpa)) {
-		pkvm_err_ratelimited("Host access to protected memory at 0x%lx\n", gpa);
-		goto failed;
-	}
-
-	pkvm_host_mmu_lock();
-
-	pkvm_pgtable_lookup(host_ept, gpa, &hpa, NULL, &level);
-	if (VALID_PAGE(hpa)) {
-		/*
-		 * Some other CPU has just mapped in the host EPT. Vmenter
-		 * the host VM and retry.
-		 */
-		pkvm_host_mmu_unlock();
-		return;
-	}
-
-	BUG_ON(level > host_ept->cap.level);
-	/*
-	 * Based on the looked up level, find out the possible maximum page-size
-	 * aligned address range which contains the GPA address for installing
-	 * the MMIO mapping, to minimize the memory consumption.
-	 */
-	for (; level > PG_LEVEL_NONE; level--) {
-		unsigned long size;
-
-		if (!((1 << level) & host_ept->cap.allowed_pgsz))
-			continue;
-
-		size = ept_level_to_size(level);
-		cur.start = ALIGN_DOWN(gpa, size);
-		cur.end = cur.start + size - 1;
-
-		if (range_contains(&range, &cur) && !overlaps_pvmfw(cur.start, size) &&
-		    !overlaps_iommu_mmio(cur.start, size)) {
-			/*
-			 * TODO: In case the host mmu free pages are not
-			 * enough, -ENOMEM will be returned. This could be
-			 * handled by unmaping some other MMIO mapped for the
-			 * host VM to reclaim some mmu pages and try again.
-			 */
-			ret = pkvm_hyp_donate_host_mmio_locked(cur.start, size);
-			break;
-		}
-	}
-
-	if (ret)
-		pkvm_err("No valid range found to map host GPA 0x%lx, err %d\n", gpa, ret);
-
-	pkvm_host_mmu_unlock();
-
-	if (likely(!ret))
-		return;
-failed:
-	handle_host_ept_violation_failure(vcpu);
+	if (unlikely(pkvm_host_mmu_handle_fault(gpa)))
+		handle_host_ept_violation_failure(vcpu);
 }
 
 void pkvm_flush_host_ept(void)
@@ -544,6 +480,7 @@ void pkvm_guest_ept_setup(void)
 		.allowed_pgsz = 1 << PG_LEVEL_4K,
 		.table_prot = VMX_EPT_RWX_MASK,
 		.flush_tlb_lazy = true,
+		.coalesce_on_map = true,
 	};
 
 	if (cpu_has_vmx_ept_2m_page())

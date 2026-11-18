@@ -84,6 +84,15 @@ struct pkvm_pgtable_cap {
 	int allowed_pgsz;
 	u64 table_prot;
 	bool flush_tlb_lazy;
+	/*
+	 * Huge page coalescing requires TLB flushing, which is not yet
+	 * implemented for hyp_mmu (hyp_mmu_flush_tlb() currently BUG()s).
+	 *
+	 * TODO(b/541580341): Remove coalesce_on_map and enable huge page
+	 * coalescing unconditionally once TLB flushing is implemented for
+	 * hyp_mmu.
+	 */
+	bool coalesce_on_map;
 };
 
 struct pkvm_pgtable {
@@ -148,8 +157,8 @@ int pkvm_pgtable_unmap(struct pkvm_pgtable *pgt, unsigned long vaddr,
 		       unsigned long phys, unsigned long size);
 int pkvm_pgtable_set_owner(struct pkvm_pgtable *pgt, unsigned long vaddr,
 			   unsigned long size, enum pkvm_owner_id owner);
-void pkvm_pgtable_lookup(struct pkvm_pgtable *pgt, unsigned long vaddr,
-			 unsigned long *phys, u64 *prot, int *level);
+int pkvm_pgtable_lookup(struct pkvm_pgtable *pgt, unsigned long vaddr,
+			u64 *pte, int *level);
 void pkvm_pgtable_lookup_range(struct pkvm_pgtable *pgt,
 			       unsigned long vaddr, unsigned long size,
 			       unsigned long *range_vaddr,

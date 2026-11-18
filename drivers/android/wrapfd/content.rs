@@ -15,9 +15,21 @@ use kernel::{
     types::ARef,
 };
 
+struct Listener {
+    ops: *const bindings::wrapfd_listener_operations,
+    param: *mut ffi::c_void,
+}
+
+// SAFETY: `Listener` can be safely sent across threads.
+unsafe impl Send for Listener {}
+
+// SAFETY: `Listener` can be shared across threads.
+unsafe impl Sync for Listener {}
+
 pub(crate) struct DmaBufContent {
     pub(crate) dmabuf: ARef<DmaBuf>,
     writable: bool,
+    listeners: KVec<Pin<KBox<Listener>>>,
 }
 
 impl DmaBufContent {
@@ -33,6 +45,11 @@ impl DmaBufContent {
         self.writable = writable;
 
         Ok(())
+    }
+
+    fn clear(&mut self) -> Result {
+        let map = self.dmabuf.vmap()?;
+        map.begin_cpu_access_to(|mut access| access.memset(0, 0, self.dmabuf.size()))
     }
 
     pub(crate) fn is_writable(&self) -> bool {
@@ -51,13 +68,20 @@ impl DmaBufContent {
             return Err(EACCES);
         }
 
-        Ok(Self { dmabuf, writable })
+        let listeners = KVec::new();
+
+        Ok(Self {
+            dmabuf,
+            writable,
+            listeners,
+        })
     }
 
-    pub(crate) fn create_wrap(
-        context: Pin<KBox<Wrap>>,
-        content: DmaBufContent,
+    pub(crate) fn publish_wrap(
+        wrap: Pin<KBox<Wrap>>,
+        mut content: DmaBufContent,
         close_on_exec: bool,
+        clear_content: bool,
     ) -> Result<u32, (Error, DmaBufContent)> {
         let size = content.dmabuf.size();
         let size = match Offset::try_from(size) {
@@ -86,20 +110,19 @@ impl DmaBufContent {
             Ok(reservation) => reservation,
         };
 
-        let inner_clone = Arc::clone(&context.inner);
-        let mut guard = inner_clone.lock();
-        guard.content = Some(content);
+        let inner_clone = Arc::clone(&wrap.inner);
 
-        let file =
-            create_wrap_file(c_str!("[wrapfd]"), context, flags).map_err(|(err, _context)| {
-                let content = guard
-                    .content
-                    .take()
-                    .expect("We put a Some() in, we expect it still to be there");
-                (err, content)
-            })?;
+        let file = match create_wrap_file(c_str!("[wrapfd]"), wrap, flags) {
+            Ok(file) => file,
+            Err((err, _wrap)) => return Err((err, content)),
+        };
 
-        drop(guard);
+        if clear_content {
+            content.notify_listeners();
+            _ = content.clear();
+        }
+
+        inner_clone.lock().content = Some(content);
 
         // SAFETY: `file` is a valid `kernel::fs::File` reference, ensuring `file.as_ptr()` is
         // non-null and points to an active `struct file`.
@@ -115,10 +138,8 @@ impl DmaBufContent {
         Ok(fd)
     }
 
-    pub(crate) fn ioctl(&self, cmd: u32, arg: usize) -> Result<isize> {
-        // pr_info!("DmaBufContent::ioctl\n");
-
-        let file = self.dmabuf.file();
+    pub(crate) fn ioctl(dmabuf: &DmaBuf, cmd: u32, arg: usize) -> Result<isize> {
+        let file = dmabuf.file();
         let file_ptr = file.as_ptr();
 
         // SAFETY: "file" is valid as "dmabuf" holds a reference to it.
@@ -149,8 +170,8 @@ impl DmaBufContent {
         }
     }
 
-    pub(crate) fn llseek(&mut self, offs: Offset, whence: ffi::c_int) -> Result<Offset> {
-        let file = self.dmabuf.file();
+    pub(crate) fn llseek(dmabuf: &DmaBuf, offs: Offset, whence: ffi::c_int) -> Result<Offset> {
+        let file = dmabuf.file();
         let file_ptr = file.as_ptr();
 
         // SAFETY: "file" is valid as "dmabuf" holds a reference to it.
@@ -194,8 +215,8 @@ impl DmaBufContent {
             return Err(EINVAL);
         };
 
-        // SAFETY: We've verified that the `dmabuf` has the required dimensions and we're making
-        // sure to pass that same map to `complete` later.
+        // SAFETY: We've verified that the `dmabuf` has the required dimensions and `map` keeps
+        // the buffer mapped across `read()`.
         let mut io_context = unsafe { IoContext::new(file_offs, vaddr, buf_offs, len)? };
         io_context.prepare(file)?;
 
@@ -209,8 +230,6 @@ impl DmaBufContent {
         buf_offs: Offset,
         len: Offset,
     ) -> Result<isize> {
-        // pr_info!("DmaBufContent::load\n");
-
         let file_offs: usize = file_offs.try_into()?;
         let buf_offs: usize = buf_offs.try_into()?;
         let len: usize = len.try_into()?;
@@ -219,11 +238,61 @@ impl DmaBufContent {
 
         map.begin_cpu_access_bidirectional_fallible(|access| -> Result<()> {
             io_context.read()?;
-            io_context.complete(&map, access)?;
+            io_context.complete(access)?;
 
             Ok(())
         })?;
 
         Ok(0)
+    }
+
+    pub(crate) fn add_listener(
+        &mut self,
+        ops: *const bindings::wrapfd_listener_operations,
+        param: *mut ffi::c_void,
+    ) -> Result<*const ffi::c_void> {
+        let listener = KBox::pin(Listener { ops, param }, GFP_KERNEL)?;
+        let handle = listener.as_ref().get_ref() as *const Listener as _;
+        self.listeners.push(listener, GFP_KERNEL)?;
+        Ok(handle)
+    }
+
+    pub(crate) fn remove_listener(&mut self, handle: *mut ffi::c_void) -> Result<()> {
+        let index = (0..self.listeners.len())
+            .position(|index| {
+                let listener = &self.listeners[index];
+                let listener_handle =
+                    listener.as_ref().get_ref() as *const Listener as *const ffi::c_void;
+
+                listener_handle == handle
+            })
+            .ok_or(EINVAL)?;
+
+        _ = self.listeners.remove(index);
+
+        Ok(())
+    }
+
+    fn notify_listeners(&mut self) {
+        let mut listeners = KVec::new();
+        core::mem::swap(&mut self.listeners, &mut listeners);
+
+        for listener in listeners {
+            // SAFETY: We've previously verified that `ops` is a non-null pointer, the contract for
+            // `wrapfd_add_listener` requires `ops` to point to a valid `struct
+            // wrapfd_listener_operation` and remain valid for as long as the listener is
+            // registered.
+            let Some(on_content_release) = (unsafe { (*listener.ops).on_content_release }) else {
+                continue;
+            };
+            // SAFETY: Safe by contract.
+            unsafe { on_content_release(listener.param) };
+        }
+    }
+}
+
+impl Drop for DmaBufContent {
+    fn drop(&mut self) {
+        self.notify_listeners();
     }
 }

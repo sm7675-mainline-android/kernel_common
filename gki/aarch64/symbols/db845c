@@ -155,6 +155,7 @@
   devm_gpiochip_add_data_with_key
   devm_gpiod_get
   devm_gpiod_get_optional
+  devm_hwmon_device_register_with_groups
   devm_ioremap
   devm_ioremap_resource
   devm_ioremap_wc
@@ -204,7 +205,7 @@
   devm_snd_soc_register_card
   devm_snd_soc_register_component
   __devm_spi_alloc_controller
-  devm_spi_register_controller
+  devm_thermal_add_hwmon_sysfs
   devm_thermal_of_zone_register
   devm_watchdog_register_device
   _dev_notice
@@ -529,6 +530,7 @@
   module_put
   __msecs_to_jiffies
   msleep
+  mtree_load
   __mutex_init
   mutex_is_locked
   mutex_lock
@@ -873,6 +875,8 @@
   spi_controller_resume
   spi_controller_suspend
   spi_finalize_current_transfer
+  spi_register_controller
+  spi_unregister_controller
   sprintf
   sscanf
   __stack_chk_fail
@@ -1046,10 +1050,12 @@
   in6_dev_finish_destroy
   of_graph_get_port_parent
   of_graph_get_remote_endpoint
+  of_reserved_mem_region_to_resource_byname
   panic_notifier_list
   pskb_put
   si_meminfo
   skb_cow_data
+  skb_pull_data
   system_bh_wq
 
 # required by bam_dma.ko
@@ -1219,6 +1225,7 @@
   reservation_ww_class
 
 # required by drm_gpuvm.ko
+  drm_dev_get
   __rb_erase_color
   __rb_insert_augmented
   rb_prev
@@ -1408,6 +1415,7 @@
   __skb_gso_segment
   strncpy
   tasklet_unlock_wait
+  timer_shutdown_sync
   unregister_inet6addr_notifier
   unregister_inetaddr_notifier
 
@@ -1928,8 +1936,10 @@
 
 # required by qcom-scm.ko
   __arm_smccc_smc
+  irq_create_fwspec_mapping
   kimage_voffset
   kstrtobool
+  of_reserved_mem_device_release
   __sysfs_match_string
 
 # required by qcom-spmi-adc-tm5.ko
@@ -1988,6 +1998,7 @@
   of_find_compatible_node
 
 # required by qcom_pmic_tcpm.ko
+  disable_delayed_work_sync
   tcpm_cc_change
   tcpm_pd_hard_reset
   tcpm_pd_receive
@@ -2015,6 +2026,7 @@
 # required by qcom_rpmh.ko
   arch_timer_read_counter
   cpu_pm_register_notifier
+  cpu_pm_unregister_notifier
   dev_pm_genpd_get_next_hrtimer
   __num_online_cpus
   _raw_spin_trylock
@@ -2028,6 +2040,8 @@
   pm_suspend_target_state
 
 # required by qcom_tzmem.ko
+  __do_once_done
+  __do_once_start
   gen_pool_add_owner
   gen_pool_alloc_algo_owner
   gen_pool_best_fit
@@ -2137,6 +2151,7 @@
   __device_set_driver_override
   platform_device_add
   platform_device_alloc
+  platform_device_del
   wait_for_completion_interruptible_timeout
 
 # required by slimbus.ko
@@ -2207,6 +2222,7 @@
 
 # required by snd-soc-rt5682s.ko
   clk_get_parent
+  disable_delayed_work_sync
   regmap_get_device
   snd_soc_dapm_get_bias_level
 
@@ -2229,6 +2245,9 @@
 # required by snd-soc-wsa881x.ko
   gpiod_is_active_low
 
+# required by snd-soc-wsa884x.ko
+  devm_hwmon_device_register_with_info
+
 # required by socinfo.ko
   add_device_randomness
   soc_device_register
@@ -2250,6 +2269,7 @@
   of_property_read_variable_u16_array
 
 # required by spi-geni-qcom.ko
+  devm_spi_register_controller
   geni_se_clk_freq_match
   geni_se_rx_init_dma
   geni_se_tx_init_dma
@@ -2266,8 +2286,6 @@
   dmam_pool_create
   icc_disable
   icc_enable
-  spi_register_controller
-  spi_unregister_controller
 
 # required by spi-qup.ko
   cache_line_size
@@ -2293,6 +2311,7 @@
 
 # required by ucsi_glink.ko
   devm_gpiod_get_index_optional
+  disable_work_sync
   typec_set_orientation
   ucsi_create
   ucsi_destroy

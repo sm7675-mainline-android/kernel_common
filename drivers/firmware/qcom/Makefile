@@ -18,6 +18,7 @@ qcom-scm-objs += qcom_scm.o qcom_scm-smc.o qcom_scm-legacy.o qtee_shmbridge.o
 # calls qcom_scm_shm_bridge_*() while qcom_scm calls qcom_tzmem_alloc(), which
 # depmod reports as "Cycle detected: qcom_tzmem -> qcom_scm -> qcom_tzmem" and
 # then neither module loads.  Keep GENERIC.
+CFLAGS_qcom_scm-smc.o := -I$(src)
 obj-$(CONFIG_QCOM_TZMEM)	+= qcom_tzmem.o
 obj-$(CONFIG_QCOM_QSEECOM)	+= qcom_qseecom.o
 obj-$(CONFIG_QCOM_QSEECOM_UEFISECAPP) += qcom_qseecom_uefisecapp.o

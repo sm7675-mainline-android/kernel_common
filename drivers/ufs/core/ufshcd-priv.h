@@ -8,7 +8,6 @@
 
 struct ufs_hba_priv {
 	struct ufs_hba hba;
-	bool zwor_sup;
 	spinlock_t diag_lock;
 	struct delayed_work diag_work;
 	DECLARE_BITMAP(diag_pending, 256);
@@ -21,6 +20,14 @@ struct ufs_hba_priv {
 	unsigned long diag_last_h8;
 	bool diag_stalled;
 	bool diag_h8_verbose;
+	/* Serializes AHIT register access between sysfs and the host driver */
+	struct mutex ahit_mutex;
+	/*
+	 * Nesting count of host-driver paths that have AHIT forced off.
+	 * Non-zero blocks sysfs AHIT writes; AHIT is reprogrammed only when
+	 * the last disabler drops it back to zero. Guarded by ahit_mutex.
+	 */
+	int ahit_disable_depth;
 };
 
 static inline struct ufs_hba_priv *to_hba_priv(struct ufs_hba *hba)
@@ -91,11 +98,17 @@ int ufshcd_pause_command_processing(struct ufs_hba *hba, u64 timeout_us);
 void ufshcd_resume_command_processing(struct ufs_hba *hba);
 int ufshcd_scale_clks(struct ufs_hba *hba, unsigned long freq, bool scale_up);
 
-#define SD_ASCII_STD true
-#define SD_RAW false
-int ufshcd_read_string_desc(struct ufs_hba *hba, u8 desc_index,
-			    u8 **buf, bool ascii);
+/**
+ * enum ufs_descr_fmt - UFS string descriptor format
+ * @SD_RAW: Raw UTF-16 format
+ * @SD_ASCII_STD: Convert to null-terminated ASCII string
+ */
+enum ufs_descr_fmt {
+	SD_RAW = 0,
+	SD_ASCII_STD = 1,
+};
 
+int ufshcd_read_string_desc(struct ufs_hba *hba, u8 desc_index, u8 **buf, enum ufs_descr_fmt fmt);
 int ufshcd_send_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd);
 int ufshcd_send_bsg_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd);
 

@@ -24,6 +24,16 @@
 struct cfg80211_scan_request_int {
 	struct cfg80211_scan_info info;
 	bool notified;
+	/*
+	 * set while the request is handed to the driver, i.e. between
+	 * rdev_scan() and cfg80211_scan_done()
+	 */
+	bool driver_owns;
+	/*
+	 * set when cfg80211 is done with the request but the driver still
+	 * owns it, so that cfg80211_scan_done() knows to just free it
+	 */
+	bool stale;
 	/* must be last - variable members */
 	struct cfg80211_scan_request req;
 };
@@ -578,17 +588,6 @@ cfg80211_get_6ghz_power_type(const u8 *elems, size_t elems_len);
  */
 #define CFG80211_DEV_WARN_ON(cond)	({bool __r = (cond); __r; })
 #endif
-
-static inline struct wiphy_work *wdev_to_pmsr_wk(struct wireless_dev *wdev)
-{
-	return (struct wiphy_work *)&wdev->pmsr_free_wk;
-}
-
-static inline struct wireless_dev *pmsr_wk_to_wdev(struct wiphy_work *work)
-{
-	return container_of((struct work_struct *)work,
-			    struct wireless_dev, pmsr_free_wk);
-}
 
 void cfg80211_release_pmsr(struct wireless_dev *wdev, u32 portid);
 void cfg80211_pmsr_wdev_down(struct wireless_dev *wdev);

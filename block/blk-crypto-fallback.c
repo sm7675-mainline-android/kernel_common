@@ -431,8 +431,7 @@ static void blk_crypto_fallback_encrypt_bio(struct bio *src_bio)
 	status = blk_crypto_get_keyslot(blk_crypto_fallback_profile,
 					bc->bc_key, &slot);
 	if (status != BLK_STS_OK) {
-		src_bio->bi_status = status;
-		bio_endio(src_bio);
+		bio_endio_status(src_bio, status);
 		return;
 	}
 	__blk_crypto_fallback_encrypt_bio(src_bio,
@@ -507,8 +506,7 @@ static void blk_crypto_fallback_decrypt_bio(struct work_struct *work)
 	}
 	mempool_free(f_ctx, bio_fallback_crypt_ctx_pool);
 
-	bio->bi_status = status;
-	bio_endio(bio);
+	bio_endio_status(bio, status);
 }
 
 /**
@@ -569,8 +567,7 @@ bool blk_crypto_fallback_bio_prep(struct bio *bio)
 
 	if (!__blk_crypto_cfg_supported(blk_crypto_fallback_profile,
 					&bc->bc_key->crypto_cfg)) {
-		bio->bi_status = BLK_STS_NOTSUPP;
-		bio_endio(bio);
+		bio_endio_status(bio, BLK_STS_NOTSUPP);
 		return false;
 	}
 
@@ -597,6 +594,12 @@ bool blk_crypto_fallback_bio_prep(struct bio *bio)
 
 int blk_crypto_fallback_evict_key(const struct blk_crypto_key *key)
 {
+	/*
+	 * Pairs with smp_store_release() in
+	 * blk_crypto_fallback_start_using_mode()
+	 */
+	if (!smp_load_acquire(&tfms_inited[key->crypto_cfg.crypto_mode]))
+		return 0;
 	return __blk_crypto_evict_key(blk_crypto_fallback_profile, key);
 }
 

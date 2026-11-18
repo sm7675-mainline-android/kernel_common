@@ -48,12 +48,19 @@ int qcom_scm_delete_shm_bridge(u64 handle);
 #include <linux/sizes.h>
 #include <linux/types.h>
 
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
 #include "qcom_scm.h"
 #include "qcom_tzmem.h"
 #include "qtee_shmbridge_internal.h"
 #include <linux/qtee_shmbridge.h>
 
 static u32 download_mode;
+
+#define GIC_SPI_BASE        32
+#define GIC_MAX_SPI       1019  // SPIs in GICv3 spec range from 32..1019
+#define GIC_ESPI_BASE     4096
+#define GIC_MAX_ESPI      5119 // ESPIs in GICv3 spec range from 4096..5119
 
 struct qcom_scm {
 	struct device *dev;
@@ -67,6 +74,7 @@ struct qcom_scm {
 	 */
 	struct idr waitq_idr;
 	spinlock_t waitq_lock;
+	struct completion *waitq_comps;
 	struct reset_controller_dev reset;
 
 	/* control access to the interconnect path */
@@ -76,6 +84,7 @@ struct qcom_scm {
 	u64 dload_mode_addr;
 
 	struct qcom_tzmem_pool *mempool;
+	unsigned int wq_cnt;
 };
 
 struct qcom_scm_current_perm_info {
@@ -177,20 +186,26 @@ static struct qcom_scm *__scm;
  * Keep one completion per firmware context. Allocate under wq_lock with
  * GFP_ATOMIC and retain entries for reuse.
  */
-static struct completion *qcom_scm_lookup_wq(u32 wq_ctx)
+static struct completion *qcom_scm_lookup_wq(struct qcom_scm *scm, u32 wq_ctx)
 {
 	struct completion *wq, *new;
 	unsigned long flags;
 	int err;
 
+	if (scm->waitq_comps) {
+		if (WARN_ON_ONCE(wq_ctx >= scm->wq_cnt))
+			return ERR_PTR(-EINVAL);
+		return &scm->waitq_comps[wq_ctx];
+	}
+
 	if (wq_ctx > 0xFFFF) {
-		dev_err(__scm->dev, "bogus wq_ctx %u\n", wq_ctx);
+		dev_err(scm->dev, "bogus wq_ctx %u\n", wq_ctx);
 		return ERR_PTR(-EINVAL);
 	}
 
-	spin_lock_irqsave(&__scm->waitq_lock, flags);
-	wq = idr_find(&__scm->waitq_idr, wq_ctx);
-	spin_unlock_irqrestore(&__scm->waitq_lock, flags);
+	spin_lock_irqsave(&scm->waitq_lock, flags);
+	wq = idr_find(&scm->waitq_idr, wq_ctx);
+	spin_unlock_irqrestore(&scm->waitq_lock, flags);
 	if (wq)
 		return wq;
 
@@ -199,17 +214,17 @@ static struct completion *qcom_scm_lookup_wq(u32 wq_ctx)
 		return ERR_PTR(-ENOMEM);
 	init_completion(new);
 
-	spin_lock_irqsave(&__scm->waitq_lock, flags);
-	wq = idr_find(&__scm->waitq_idr, wq_ctx);
+	spin_lock_irqsave(&scm->waitq_lock, flags);
+	wq = idr_find(&scm->waitq_idr, wq_ctx);
 	if (!wq) {
-		err = idr_alloc(&__scm->waitq_idr, new, wq_ctx, wq_ctx + 1,
+		err = idr_alloc(&scm->waitq_idr, new, wq_ctx, wq_ctx + 1,
 				GFP_ATOMIC);
 		if (err < 0)
 			wq = ERR_PTR(err);
 		else
 			wq = new;
 	}
-	spin_unlock_irqrestore(&__scm->waitq_lock, flags);
+	spin_unlock_irqrestore(&scm->waitq_lock, flags);
 
 	if (wq != new)
 		kfree(new);
@@ -659,10 +674,44 @@ void qcom_scm_set_download_mode(enum qcom_download_mode mode,
 EXPORT_SYMBOL(qcom_scm_set_download_mode);
 
 /**
+ * devm_qcom_scm_pas_context_alloc() - Allocate peripheral authentication service
+ *				       context for a given peripheral
+ *
+ * PAS context is device-resource managed, so the caller does not need
+ * to worry about freeing the context memory.
+ *
+ * @dev:	  PAS firmware device
+ * @pas_id:	  peripheral authentication service id
+ * @mem_phys:	  Subsystem reserve memory start address
+ * @mem_size:	  Subsystem reserve memory size
+ *
+ * Returns: The new PAS context, or ERR_PTR() on failure.
+ */
+struct qcom_scm_pas_context *devm_qcom_scm_pas_context_alloc(struct device *dev,
+							     u32 pas_id,
+							     phys_addr_t mem_phys,
+							     size_t mem_size)
+{
+	struct qcom_scm_pas_context *ctx;
+
+	ctx = devm_kzalloc(dev, sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return ERR_PTR(-ENOMEM);
+
+	ctx->dev = dev;
+	ctx->pas_id = pas_id;
+	ctx->mem_phys = mem_phys;
+	ctx->mem_size = mem_size;
+
+	return ctx;
+}
+EXPORT_SYMBOL_GPL(devm_qcom_scm_pas_context_alloc);
+
+/**
  * qcom_scm_pas_init_image() - Initialize peripheral authentication service
  *			       state machine for a given peripheral, using the
  *			       metadata
- * @peripheral: peripheral id
+ * @pas_id:	peripheral authentication service id
  * @metadata:	pointer to memory containing ELF header, program header table
  *		and optional blob of data used for authenticating the metadata
  *		and the rest of the firmware
@@ -675,7 +724,7 @@ EXPORT_SYMBOL(qcom_scm_set_download_mode);
  * track the metadata allocation, this needs to be released by invoking
  * qcom_scm_pas_metadata_release() by the caller.
  */
-int qcom_scm_pas_init_image_ex(u32 peripheral, const void *metadata, size_t size,
+int qcom_scm_pas_init_image_ex(u32 pas_id, const void *metadata, size_t size,
 			       struct qcom_scm_pas_metadata *ctx)
 {
 	dma_addr_t mdata_phys;
@@ -686,7 +735,7 @@ int qcom_scm_pas_init_image_ex(u32 peripheral, const void *metadata, size_t size
 		.svc = QCOM_SCM_SVC_PIL,
 		.cmd = QCOM_SCM_PIL_PAS_INIT_IMAGE,
 		.arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_VAL, QCOM_SCM_RW),
-		.args[0] = peripheral,
+		.args[0] = pas_id,
 		.owner = ARM_SMCCC_OWNER_SIP,
 	};
 	struct qcom_scm_res res = {};
@@ -708,7 +757,7 @@ int qcom_scm_pas_init_image_ex(u32 peripheral, const void *metadata, size_t size
 	if (!mdata_buf) {
 		dev_err_ratelimited(__scm->dev,
 			"PAS metadata allocation failed peripheral=%u size=%zu mask=%#llx coherent=%#llx bus_limit=%#llx\n",
-			peripheral, size, dma_get_mask(__scm->dev),
+			pas_id, size, dma_get_mask(__scm->dev),
 			__scm->dev->coherent_dma_mask, __scm->dev->bus_dma_limit);
 		return -ENOMEM;
 	}
@@ -737,7 +786,7 @@ out:
 	if (ret || res.result[0])
 		dev_err_ratelimited(__scm->dev,
 			"PAS init failed peripheral=%u stage=%s size=%zu phys=%pad transport=%d firmware=%lld\n",
-			peripheral, stage, size, &mdata_phys, ret,
+			pas_id, stage, size, &mdata_phys, ret,
 			(s64)res.result[0]);
 
 	if (ret < 0 || !ctx) {
@@ -817,20 +866,20 @@ EXPORT_SYMBOL_GPL(qcom_scm_pas_metadata_release);
 /**
  * qcom_scm_pas_mem_setup() - Prepare the memory related to a given peripheral
  *			      for firmware loading
- * @peripheral:	peripheral id
+ * @pas_id:	peripheral authentication service id
  * @addr:	start address of memory area to prepare
  * @size:	size of the memory area to prepare
  *
  * Returns 0 on success.
  */
-int qcom_scm_pas_mem_setup(u32 peripheral, phys_addr_t addr, phys_addr_t size)
+int qcom_scm_pas_mem_setup(u32 pas_id, phys_addr_t addr, phys_addr_t size)
 {
 	int ret;
 	struct qcom_scm_desc desc = {
 		.svc = QCOM_SCM_SVC_PIL,
 		.cmd = QCOM_SCM_PIL_PAS_MEM_SETUP,
 		.arginfo = QCOM_SCM_ARGS(3),
-		.args[0] = peripheral,
+		.args[0] = pas_id,
 		.args[1] = addr,
 		.args[2] = size,
 		.owner = ARM_SMCCC_OWNER_SIP,
@@ -858,18 +907,18 @@ EXPORT_SYMBOL_GPL(qcom_scm_pas_mem_setup);
 /**
  * qcom_scm_pas_auth_and_reset() - Authenticate the given peripheral firmware
  *				   and reset the remote processor
- * @peripheral:	peripheral id
+ * @pas_id:	peripheral authentication service id
  *
  * Return 0 on success.
  */
-int qcom_scm_pas_auth_and_reset(u32 peripheral)
+int qcom_scm_pas_auth_and_reset(u32 pas_id)
 {
 	int ret;
 	struct qcom_scm_desc desc = {
 		.svc = QCOM_SCM_SVC_PIL,
 		.cmd = QCOM_SCM_PIL_PAS_AUTH_AND_RESET,
 		.arginfo = QCOM_SCM_ARGS(1),
-		.args[0] = peripheral,
+		.args[0] = pas_id,
 		.owner = ARM_SMCCC_OWNER_SIP,
 	};
 	struct qcom_scm_res res;
@@ -894,18 +943,18 @@ EXPORT_SYMBOL_GPL(qcom_scm_pas_auth_and_reset);
 
 /**
  * qcom_scm_pas_shutdown() - Shut down the remote processor
- * @peripheral: peripheral id
+ * @pas_id:	peripheral authentication service id
  *
  * Returns 0 on success.
  */
-int qcom_scm_pas_shutdown(u32 peripheral)
+int qcom_scm_pas_shutdown(u32 pas_id)
 {
 	int ret;
 	struct qcom_scm_desc desc = {
 		.svc = QCOM_SCM_SVC_PIL,
 		.cmd = QCOM_SCM_PIL_PAS_SHUTDOWN,
 		.arginfo = QCOM_SCM_ARGS(1),
-		.args[0] = peripheral,
+		.args[0] = pas_id,
 		.owner = ARM_SMCCC_OWNER_SIP,
 	};
 	struct qcom_scm_res res;
@@ -931,18 +980,18 @@ EXPORT_SYMBOL_GPL(qcom_scm_pas_shutdown);
 /**
  * qcom_scm_pas_supported() - Check if the peripheral authentication service is
  *			      available for the given peripherial
- * @peripheral:	peripheral id
+ * @pas_id:	peripheral authentication service id
  *
  * Returns true if PAS is supported for this peripheral, otherwise false.
  */
-bool qcom_scm_pas_supported(u32 peripheral)
+bool qcom_scm_pas_supported(u32 pas_id)
 {
 	int ret;
 	struct qcom_scm_desc desc = {
 		.svc = QCOM_SCM_SVC_PIL,
 		.cmd = QCOM_SCM_PIL_PAS_IS_SUPPORTED,
 		.arginfo = QCOM_SCM_ARGS(1),
-		.args[0] = peripheral,
+		.args[0] = pas_id,
 		.owner = ARM_SMCCC_OWNER_SIP,
 	};
 	struct qcom_scm_res res;
@@ -2569,7 +2618,7 @@ EXPORT_SYMBOL_GPL(qcom_scm_is_available);
 #define QCOM_SCM_WQ_POLL_MS	20
 
 /* Drain firmware wake notifications and complete their contexts. */
-static void qcom_scm_drain_wq(void)
+static void qcom_scm_drain_wq(struct device *dev)
 {
 	u32 ctx, flags, more = 0;
 	int ret;
@@ -2580,16 +2629,17 @@ static void qcom_scm_drain_wq(void)
 			return;
 		if (flags == QCOM_SMC_WAITQ_FLAG_WAKE_NONE)
 			return;
-		qcom_scm_waitq_flag_handler(ctx, flags);
+		qcom_scm_waitq_flag_handler(dev, ctx, flags);
 	} while (more);
 }
 
-int qcom_scm_wait_for_wq_completion(u32 wq_ctx)
+int qcom_scm_wait_for_wq_completion(struct device *dev, u32 wq_ctx)
 {
+	struct qcom_scm *scm = dev_get_drvdata(dev);
 	struct completion *wq;
 	unsigned long deadline;
 
-	wq = qcom_scm_lookup_wq(wq_ctx);
+	wq = qcom_scm_lookup_wq(scm, wq_ctx);
 	if (IS_ERR(wq))
 		return PTR_ERR(wq);
 
@@ -2600,12 +2650,12 @@ int qcom_scm_wait_for_wq_completion(u32 wq_ctx)
 			return 0;
 
 		/* Poll for wakes on platforms without a wait queue IRQ. */
-		qcom_scm_drain_wq();
+		qcom_scm_drain_wq(dev);
 		if (try_wait_for_completion(wq))
 			return 0;
 
 		if (time_after(jiffies, deadline)) {
-			dev_err(__scm->dev,
+			dev_err(dev,
 				"waitq ctx %u: no wake within %u ms (irq missing?)\n",
 				wq_ctx, QCOM_SCM_WQ_TIMEOUT_MS);
 			return -ETIMEDOUT;
@@ -2614,12 +2664,13 @@ int qcom_scm_wait_for_wq_completion(u32 wq_ctx)
 	}
 }
 
-void qcom_scm_waitq_flag_handler(u32 wq_ctx, u32 flags)
+void qcom_scm_waitq_flag_handler(struct device *dev, u32 wq_ctx, u32 flags)
 {
-	struct completion *wq = qcom_scm_lookup_wq(wq_ctx);
+	struct qcom_scm *scm = dev_get_drvdata(dev);
+	struct completion *wq = qcom_scm_lookup_wq(scm, wq_ctx);
 
 	if (IS_ERR(wq)) {
-		dev_err(__scm->dev, "no completion for wq_ctx %u: %ld\n",
+		dev_err(dev, "no completion for wq_ctx %u: %ld\n",
 			wq_ctx, PTR_ERR(wq));
 		return;
 	}
@@ -2633,10 +2684,77 @@ void qcom_scm_waitq_flag_handler(u32 wq_ctx, u32 flags)
 		reinit_completion(wq);
 		break;
 	default:
-		dev_err(__scm->dev, "invalid flags %u for wq_ctx %u\n",
+		dev_err(dev, "invalid flags %u for wq_ctx %u\n",
 			flags, wq_ctx);
 		break;
 	}
+}
+
+static int qcom_scm_fill_irq_fwspec_params(struct irq_fwspec *fwspec, u32 hwirq)
+{
+	if (hwirq >= GIC_SPI_BASE && hwirq <= GIC_MAX_SPI) {
+		fwspec->param[0] = GIC_SPI;
+		fwspec->param[1] = hwirq - GIC_SPI_BASE;
+	} else if (hwirq >= GIC_ESPI_BASE && hwirq <= GIC_MAX_ESPI) {
+		fwspec->param[0] = GIC_ESPI;
+		fwspec->param[1] = hwirq - GIC_ESPI_BASE;
+	} else {
+		WARN(1, "Unexpected hwirq: %d\n", hwirq);
+		return -ENXIO;
+	}
+
+	fwspec->param[2] = IRQ_TYPE_EDGE_RISING;
+	fwspec->param_count = 3;
+
+	return 0;
+}
+
+static int qcom_scm_query_waitq_count(struct qcom_scm *scm)
+{
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_WAITQ,
+		.cmd = QCOM_SCM_WAITQ_GET_INFO,
+		.owner = ARM_SMCCC_OWNER_SIP
+	};
+	struct qcom_scm_res res;
+	int ret;
+
+	ret = qcom_scm_call_atomic(scm->dev, &desc, &res);
+	if (ret)
+		return ret;
+
+	return res.result[0] & GENMASK(7, 0);
+}
+
+static int qcom_scm_get_waitq_irq(struct qcom_scm *scm)
+{
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_WAITQ,
+		.cmd = QCOM_SCM_WAITQ_GET_INFO,
+		.owner = ARM_SMCCC_OWNER_SIP
+	};
+	struct device_node *parent_irq_node;
+	struct irq_fwspec fwspec;
+	struct qcom_scm_res res;
+	u32 hwirq;
+	int ret;
+
+	ret = qcom_scm_call_atomic(scm->dev, &desc, &res);
+	if (ret)
+		return ret;
+
+	hwirq = res.result[1] & GENMASK(15, 0);
+	ret = qcom_scm_fill_irq_fwspec_params(&fwspec, hwirq);
+	if (ret)
+		return ret;
+
+	parent_irq_node = of_irq_find_parent(scm->dev->of_node);
+	if (!parent_irq_node)
+		return -ENODEV;
+
+	fwspec.fwnode = of_fwnode_handle(parent_irq_node);
+
+	return irq_create_fwspec_mapping(&fwspec);
 }
 
 static irqreturn_t qcom_scm_irq_handler(int irq, void *data)
@@ -2656,7 +2774,7 @@ static irqreturn_t qcom_scm_irq_handler(int irq, void *data)
 		if (flags == QCOM_SMC_WAITQ_FLAG_WAKE_NONE)
 			return IRQ_HANDLED;
 
-		qcom_scm_waitq_flag_handler(wq_ctx, flags);
+		qcom_scm_waitq_flag_handler(scm->dev, wq_ctx, flags);
 	} while (more_pending);
 
 out:
@@ -2764,6 +2882,7 @@ static int qcom_scm_probe(struct platform_device *pdev)
 	struct qcom_tzmem_pool_config pool_config;
 	struct qcom_scm *scm;
 	int irq, ret;
+	int i;
 
 	scm = devm_kzalloc(&pdev->dev, sizeof(*scm), GFP_KERNEL);
 	if (!scm)
@@ -2778,6 +2897,7 @@ static int qcom_scm_probe(struct platform_device *pdev)
 		dma_get_mask(scm->dev), scm->dev->coherent_dma_mask,
 		scm->dev->bus_dma_limit);
 
+	platform_set_drvdata(pdev, scm);
 	ret = qcom_scm_find_dload_address(&pdev->dev, &scm->dload_mode_addr);
 	if (ret < 0)
 		return ret;
@@ -2821,9 +2941,11 @@ static int qcom_scm_probe(struct platform_device *pdev)
 				     "Failed to setup the reserved memory region for TZ mem\n");
 
 	ret = qcom_tzmem_enable(scm->dev);
-	if (ret)
-		return dev_err_probe(scm->dev, ret,
-				     "Failed to enable the TrustZone memory allocator\n");
+	if (ret) {
+		ret = dev_err_probe(scm->dev, ret,
+				    "Failed to enable the TrustZone memory allocator\n");
+		goto err_rmem;
+	}
 
 	memset(&pool_config, 0, sizeof(pool_config));
 	pool_config.initial_size = 0;
@@ -2831,11 +2953,30 @@ static int qcom_scm_probe(struct platform_device *pdev)
 	pool_config.max_size = SZ_256K;
 
 	scm->mempool = devm_qcom_tzmem_pool_new(scm->dev, &pool_config);
-	if (IS_ERR(scm->mempool))
-		return dev_err_probe(scm->dev, PTR_ERR(scm->mempool),
-				     "Failed to create the SCM memory pool\n");
+	if (IS_ERR(scm->mempool)) {
+		ret = dev_err_probe(scm->dev, PTR_ERR(scm->mempool),
+				    "Failed to create the SCM memory pool\n");
+		goto err_rmem;
+	}
 
-	irq = platform_get_irq_optional(pdev, 0);
+	ret = qcom_scm_query_waitq_count(scm);
+	if (ret > 0) {
+		scm->wq_cnt = ret;
+		scm->waitq_comps = devm_kcalloc(&pdev->dev, scm->wq_cnt,
+						  sizeof(*scm->waitq_comps), GFP_KERNEL);
+		if (!scm->waitq_comps) {
+			ret = -ENOMEM;
+			goto err_rmem;
+		}
+
+		for (i = 0; i < scm->wq_cnt; i++)
+			init_completion(&scm->waitq_comps[i]);
+	}
+
+	irq = qcom_scm_get_waitq_irq(scm);
+	if (irq < 0)
+		irq = platform_get_irq_optional(pdev, 0);
+
 	if (irq < 0) {
 		if (irq != -ENXIO)
 			return irq;
@@ -2888,6 +3029,10 @@ static int qcom_scm_probe(struct platform_device *pdev)
 	qcom_scm_qtee_init(scm);
 
 	return 0;
+
+err_rmem:
+	of_reserved_mem_device_release(scm->dev);
+	return ret;
 }
 
 static void qcom_scm_shutdown(struct platform_device *pdev)

@@ -10,6 +10,7 @@
  * shared outside of the drivers/base/ directory.
  *
  */
+#include <linux/android_kabi.h>
 #include <linux/notifier.h>
 
 /**
@@ -117,6 +118,8 @@ struct device_private {
 	char *deferred_probe_reason;
 	struct device *device;
 	u8 dead:1;
+
+	ANDROID_BACKPORT_RESERVE(0);
 };
 #define to_device_private_parent(obj)	\
 	container_of(obj, struct device_private, knode_parent)
@@ -151,6 +154,7 @@ struct kobject *virtual_device_parent(void);
 
 int bus_add_device(struct device *dev);
 void bus_probe_device(struct device *dev);
+void bus_probe_device_deferred(struct device *dev);
 void bus_remove_device(struct device *dev);
 void bus_notify(struct device *dev, enum bus_notifier_event value);
 bool bus_is_registered(const struct bus_type *bus);
