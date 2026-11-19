@@ -292,33 +292,68 @@ EXPORT_SYMBOL_GPL(ufshcd_mcq_write_cqis);
  * Current MCQ specification doesn't provide a Task Tag or its equivalent in
  * the Completion Queue Entry. Find the Task Tag using an indirect method.
  */
-static int ufshcd_mcq_get_tag(struct ufs_hba *hba, struct cq_entry *cqe)
+static int ufshcd_mcq_get_tag(struct ufs_hba *hba, u64 cqe_addr)
 {
-	u64 addr;
+	u64 addr = cqe_addr & CQE_UCD_BA;
+	unsigned int ucd_size = ufshcd_get_ucd_size(hba);
+	u32 remainder;
+	u64 tag;
 
 	/* sizeof(struct utp_transfer_cmd_desc) must be a multiple of 128 */
 	BUILD_BUG_ON(sizeof(struct utp_transfer_cmd_desc) & GENMASK(6, 0));
 
-	/* Bits 63:7 UCD base address, 6:5 are reserved, 4:0 is SQ ID */
-	addr = (le64_to_cpu(cqe->command_desc_base_addr) & CQE_UCD_BA) -
-		hba->ucdl_dma_addr;
+	if (!cqe_addr || addr < hba->ucdl_dma_addr)
+		return -EINVAL;
 
-	return div_u64(addr, ufshcd_get_ucd_size(hba));
+	tag = div_u64_rem(addr - hba->ucdl_dma_addr, ucd_size, &remainder);
+	if (remainder || tag >= hba->nutrs)
+		return -EINVAL;
+
+	return tag;
 }
 
-static void ufshcd_mcq_process_cqe(struct ufs_hba *hba,
-				   struct ufs_hw_queue *hwq)
+static bool ufshcd_mcq_compl_cqe(struct ufs_hba *hba, struct ufs_hw_queue *hwq,
+				struct cq_entry *cqe)
 {
-	struct cq_entry *cqe = ufshcd_mcq_cur_cqe(hwq);
-	int tag = ufshcd_mcq_get_tag(hba, cqe);
+	u64 addr = le64_to_cpu(READ_ONCE(cqe->command_desc_base_addr));
+	int tag = ufshcd_mcq_get_tag(hba, addr);
+	struct scsi_cmnd *cmd;
+	struct request *rq;
 
-	if (cqe->command_desc_base_addr) {
-		ufshcd_compl_one_cqe(hba, tag, cqe);
-		/* After processed the cqe, mark it empty (invalid) entry */
-		cqe->command_desc_base_addr = 0;
+	if (tag < 0)
+		goto invalid;
+
+	if (tag == hba->reserved_slot) {
+		if (hwq != hba->dev_cmd_queue ||
+		    !to_hba_priv(hba)->mcq_dev_cmd_pending)
+			goto invalid;
+		to_hba_priv(hba)->mcq_dev_cmd_pending = false;
+	} else {
+		cmd = READ_ONCE(hba->lrb[tag].cmd);
+		if (!cmd)
+			goto invalid;
+		rq = scsi_cmd_to_rq(cmd);
+		if (READ_ONCE(rq->tag) != tag ||
+		    ufshcd_mcq_req_to_hwq(hba, rq) != hwq ||
+		    blk_mq_rq_state(rq) != MQ_RQ_IN_FLIGHT)
+			goto invalid;
 	}
+
+	ufshcd_compl_one_cqe(hba, tag, cqe);
+	/* After processing the CQE, mark it as an empty (invalid) entry. */
+	cqe->command_desc_base_addr = 0;
+	return true;
+
+invalid:
+	dev_err_ratelimited(hba->dev, "Invalid MCQ completion q=%u slot=%u addr=%#llx tag=%d\n",
+			    hwq->id, hwq->cq_head_slot, addr, tag);
+	return false;
 }
 
+/*
+ * The controller is stopped during error recovery. Scan the entire queue
+ * without reading its registers; processed entries are marked empty.
+ */
 void ufshcd_mcq_compl_all_cqes_lock(struct ufs_hba *hba,
 				    struct ufs_hw_queue *hwq)
 {
@@ -327,13 +362,15 @@ void ufshcd_mcq_compl_all_cqes_lock(struct ufs_hba *hba,
 
 	spin_lock_irqsave(&hwq->cq_lock, flags);
 	while (entries > 0) {
-		ufshcd_mcq_process_cqe(hba, hwq);
+		struct cq_entry *cqe = ufshcd_mcq_cur_cqe(hwq);
+
+		if (cqe->command_desc_base_addr &&
+		    !ufshcd_mcq_compl_cqe(hba, hwq, cqe))
+			cqe->command_desc_base_addr = 0;
 		ufshcd_mcq_inc_cq_head_slot(hwq);
 		entries--;
 	}
 
-	ufshcd_mcq_update_cq_tail_slot(hwq);
-	hwq->cq_head_slot = hwq->cq_tail_slot;
 	spin_unlock_irqrestore(&hwq->cq_lock, flags);
 }
 
@@ -344,24 +381,41 @@ unsigned long ufshcd_mcq_poll_n_cqe_lock(struct ufs_hba *hba,
 	unsigned long completed_reqs = 0;
 	unsigned long flags;
 	u32 tail;
+	bool invalid = false;
 
 	spin_lock_irqsave(&hwq->cq_lock, flags);
 	tail = readl(hwq->mcq_cq_tail);
-	hwq->cq_tail_slot = tail / sizeof(struct cq_entry);
-	if (tail % sizeof(struct cq_entry) || hwq->cq_tail_slot >= hwq->max_entries)
+	if (tail % sizeof(struct cq_entry) ||
+	    tail / sizeof(struct cq_entry) >= hwq->max_entries) {
 		dev_err_ratelimited(hba->dev,
 			"MCQ DIAG invalid CQ before poll q=%u raw_tail=%#x sw_head=%u depth=%u task=%s/%d\n",
 			hwq->id, tail, hwq->cq_head_slot, hwq->max_entries,
 			current->comm, current->pid);
+		invalid = true;
+		goto unlock;
+	}
+	hwq->cq_tail_slot = tail / sizeof(struct cq_entry);
 	while (!ufshcd_mcq_is_cq_empty(hwq) && completed_reqs < max_compl) {
-		ufshcd_mcq_process_cqe(hba, hwq);
+		if (!ufshcd_mcq_compl_cqe(hba, hwq, ufshcd_mcq_cur_cqe(hwq))) {
+			invalid = true;
+			break;
+		}
 		ufshcd_mcq_inc_cq_head_slot(hwq);
 		completed_reqs++;
 	}
 
 	if (completed_reqs)
 		ufshcd_mcq_update_cq_head(hwq);
+unlock:
 	spin_unlock_irqrestore(&hwq->cq_lock, flags);
+
+	if (invalid) {
+		spin_lock_irqsave(hba->host->host_lock, flags);
+		hba->force_reset = true;
+		if (current_work() != &hba->eh_work)
+			ufshcd_schedule_eh_work(hba);
+		spin_unlock_irqrestore(hba->host->host_lock, flags);
+	}
 
 	return completed_reqs;
 }

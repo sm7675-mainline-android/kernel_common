@@ -20,6 +20,7 @@ struct ufs_hba_priv {
 	unsigned long diag_last_h8;
 	bool diag_stalled;
 	bool diag_h8_verbose;
+	bool mcq_dev_cmd_pending;
 	/* Serializes AHIT register access between sysfs and the host driver */
 	struct mutex ahit_mutex;
 	/*

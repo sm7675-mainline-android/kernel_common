@@ -3494,11 +3494,26 @@ static void ufshcd_dev_man_unlock(struct ufs_hba *hba)
 static int ufshcd_issue_dev_cmd(struct ufs_hba *hba, struct ufshcd_lrb *lrbp,
 			  const u32 tag, int timeout)
 {
+	struct ufs_hw_queue *hwq = hba->dev_cmd_queue;
+	struct ufs_hba_priv *priv = to_hba_priv(hba);
+	bool mcq = hba->mcq_enabled;
+	unsigned long flags;
 	int err;
 
 	ufshcd_add_query_upiu_trace(hba, UFS_QUERY_SEND, lrbp->ucd_req_ptr);
-	ufshcd_send_command(hba, tag, hba->dev_cmd_queue);
+	if (mcq) {
+		spin_lock_irqsave(&hwq->cq_lock, flags);
+		reinit_completion(&hba->dev_cmd.complete);
+		priv->mcq_dev_cmd_pending = true;
+		spin_unlock_irqrestore(&hwq->cq_lock, flags);
+	}
+	ufshcd_send_command(hba, tag, hwq);
 	err = ufshcd_wait_for_dev_cmd(hba, lrbp, timeout);
+	if (mcq) {
+		spin_lock_irqsave(&hwq->cq_lock, flags);
+		priv->mcq_dev_cmd_pending = false;
+		spin_unlock_irqrestore(&hwq->cq_lock, flags);
+	}
 
 	ufshcd_add_query_upiu_trace(hba, err ? UFS_QUERY_ERR : UFS_QUERY_COMP,
 				    (struct utp_upiu_req *)lrbp->ucd_rsp_ptr);
