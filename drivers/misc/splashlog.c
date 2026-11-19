@@ -187,6 +187,15 @@ static unsigned int sl_halt;
 /* Serializes text rings, persistent writes and framebuffer updates. */
 static DEFINE_RAW_SPINLOCK(sl_lock);
 
+static bool sl_log_lock(unsigned long *flags)
+{
+	if (panic_in_progress() || READ_ONCE(oops_in_progress))
+		return raw_spin_trylock_irqsave(&sl_lock, *flags);
+
+	raw_spin_lock_irqsave(&sl_lock, *flags);
+	return true;
+}
+
 static void sl_feed_locked(const char *s, unsigned int count, bool to_bb);
 static void sl_render(void);
 static void sl_render_locked(bool partial);
@@ -1241,7 +1250,7 @@ struct sl_bb_canary {
 	u32 hdr_sig;
 	s32 hdr_start;
 	s32 hdr_size;
-	u32 rsvd2;
+	u32 panic_pending;
 };
 
 static void sl_bb_clean(void *p, size_t len)
@@ -1252,6 +1261,17 @@ static void sl_bb_clean(void *p, size_t len)
 static struct sl_bb_canary *sl_canary(void)
 {
 	return (struct sl_bb_canary *)(sl_bb + SL_CANARY_OFF);
+}
+
+static void sl_canary_set_pending(bool pending)
+{
+	struct sl_bb_canary *canary;
+
+	if (!sl_bb_ok)
+		return;
+	canary = sl_canary();
+	WRITE_ONCE(canary->panic_pending, pending ? SL_CANARY_MAGIC : 0);
+	sl_bb_clean(&canary->panic_pending, sizeof(canary->panic_pending));
 }
 
 static bool sl_canary_window_ok(const struct sl_bb_canary *c)
@@ -1302,7 +1322,6 @@ static void sl_canary_mark(bool panic)
 	c->hdr_sig = panic ? h->sig : 0;
 	c->hdr_start = panic ? h->start : 0;
 	c->hdr_size = panic ? h->size : 0;
-	c->rsvd2 = 0;
 	sl_bb_clean(c, sizeof(*c));
 }
 
@@ -1343,6 +1362,7 @@ static bool sl_bb_setup(void)
 {
 	struct sl_bb_hdr *h;
 	struct sl_bb_canary *c;
+	bool pending = false;
 
 	sl_bb = (u8 *)__va(sl_bb_phys);
 	if (!sl_bb)
@@ -1354,10 +1374,13 @@ static bool sl_bb_setup(void)
 	c = sl_canary();
 	if (c->magic == SL_CANARY_MAGIC && c->boots && c->boots < 0xffff) {
 		sl_boots = c->boots + 1;
-		sl_prev_panic = c->panic;
-		sl_prev_sig = c->hdr_sig;
-		sl_prev_start = c->hdr_start;
-		sl_prev_size = c->hdr_size;
+		pending = c->panic_pending == SL_CANARY_MAGIC;
+		sl_prev_panic = pending || c->panic;
+		if (!pending) {
+			sl_prev_sig = c->hdr_sig;
+			sl_prev_start = c->hdr_start;
+			sl_prev_size = c->hdr_size;
+		}
 	} else {
 		sl_boots = 1;
 		sl_prev_panic = 0;
@@ -1366,26 +1389,27 @@ static bool sl_bb_setup(void)
 		sl_prev_size = 0;
 	}
 
-	if (h->sig == SL_BB_MAGIC &&
+	sl_bb_ok = true;
+	sl_canary_set_pending(false);
+	if (pending)
+		pr_warn("splashlog: incomplete panic capture; skipping blackbox replay\n");
+	if (!pending && h->sig == SL_BB_MAGIC &&
 	    h->size > 0 && h->size <= (s32)sl_bb_room &&
 	    h->start >= 0 && h->start <= h->size) {
-		sl_bb_ok = true;
 		sl_canary_mark(false);
 		return true;
 	}
 
-	if (sl_prev_panic && sl_canary_window_ok(c) &&
+	if (!pending && sl_prev_panic && sl_canary_window_ok(c) &&
 	    sl_bb_looks_text(c->hdr_start, c->hdr_size)) {
 		h->sig = SL_BB_MAGIC;
 		h->start = c->hdr_start;
 		h->size = c->hdr_size;
 		sl_bb_clean(h, sizeof(*h));
-		sl_bb_ok = true;
 		sl_canary_mark(false);
 		return true;
 	}
 
-	sl_bb_ok = true;
 	sl_canary_mark(false);
 
 	h->sig = 0;
@@ -1614,16 +1638,22 @@ void splashlog_display_takeover(void)
 }
 EXPORT_SYMBOL_GPL(splashlog_display_takeover);
 
-static void sl_fault_display(void)
+static void sl_fault_display_locked(void)
 {
-	unsigned long flags;
-
-	raw_spin_lock_irqsave(&sl_lock, flags);
 	if (sl_native_display && sl_fb_mode != 3) {
 		sl_fb_frozen = false;
 		sl_force = true;
 		sl_dirty = true;
 	}
+}
+
+static void sl_fault_display(void)
+{
+	unsigned long flags;
+
+	if (!sl_log_lock(&flags))
+		return;
+	sl_fault_display_locked();
 	raw_spin_unlock_irqrestore(&sl_lock, flags);
 }
 
@@ -1942,9 +1972,8 @@ static void sl_render(void)
 {
 	unsigned long flags;
 
-	if (!sl_ready)
+	if (!sl_ready || !sl_log_lock(&flags))
 		return;
-	raw_spin_lock_irqsave(&sl_lock, flags);
 	sl_render_locked(false);
 	raw_spin_unlock_irqrestore(&sl_lock, flags);
 }
@@ -1952,7 +1981,8 @@ static void sl_render(void)
 /* Timers are unavailable during the setup_arch() early console stage. */
 static void sl_kick(void)
 {
-	if (!sl_rtimer_ok || sl_rtimer_armed || sl_dead || sl_fb_frozen)
+	if (!sl_rtimer_ok || sl_rtimer_armed || sl_dead || sl_fb_frozen ||
+	    panic_in_progress() || READ_ONCE(oops_in_progress))
 		return;
 	sl_rtimer_armed = true;
 	mod_timer(&sl_rtimer, jiffies + SL_RENDER_J);
@@ -1969,17 +1999,23 @@ static void sl_render_tick(struct timer_list *t)
 	raw_spin_unlock_irqrestore(&sl_lock, flags);
 }
 
-static void sl_border(u32 c)
+static void sl_border_locked(u32 c)
 {
-	unsigned long flags;
-
 	if (!sl_ready)
 		return;
-	raw_spin_lock_irqsave(&sl_lock, flags);
 	sl_rect(0, 0, sl_w, 24, c);
 	sl_rect(0, sl_h - 24, sl_w, 24, c);
 	sl_clean(0, 24);
 	sl_clean(sl_h - 24, sl_h);
+}
+
+static void sl_border(u32 c)
+{
+	unsigned long flags;
+
+	if (!sl_log_lock(&flags))
+		return;
+	sl_border_locked(c);
 	raw_spin_unlock_irqrestore(&sl_lock, flags);
 }
 
@@ -2026,7 +2062,8 @@ static void sl_puts(const char *s, bool to_bb)
 {
 	unsigned long flags;
 
-	raw_spin_lock_irqsave(&sl_lock, flags);
+	if (!sl_log_lock(&flags))
+		return;
 	sl_feed_locked(s, strlen(s), to_bb);
 	raw_spin_unlock_irqrestore(&sl_lock, flags);
 }
@@ -2115,8 +2152,16 @@ static void sl_con_write(struct console *co, const char *s, unsigned int count)
 {
 	unsigned long flags;
 
-	if (sl_dead)
+	if (READ_ONCE(sl_dead))
 		return;
+	if (panic_in_progress() || READ_ONCE(oops_in_progress)) {
+		if (raw_spin_trylock_irqsave(&sl_lock, flags)) {
+			if (!sl_chunk_matches(s, count) && !sl_drop_panic_trace(s, count))
+				sl_feed_locked(s, count, true);
+			raw_spin_unlock_irqrestore(&sl_lock, flags);
+		}
+		return;
+	}
 	WRITE_ONCE(sl_last_console, jiffies);
 	atomic_inc(&sl_console_count);
 	if (sl_bootdump >= 1)
@@ -2637,7 +2682,8 @@ static void sl_bb_puts(const char *s)
 {
 	unsigned long flags;
 
-	raw_spin_lock_irqsave(&sl_lock, flags);
+	if (!sl_log_lock(&flags))
+		return;
 	sl_bb_write_locked(s, strlen(s));
 	raw_spin_unlock_irqrestore(&sl_lock, flags);
 }
@@ -2727,18 +2773,21 @@ static void sl_dump_kmsg(void)
 
 	kmsg_dump_rewind(&iter);
 
-	raw_spin_lock_irqsave(&sl_lock, flags);
+	if (!sl_log_lock(&flags))
+		return;
 	sl_head = 0;
 	sl_used = 1;
 	sl_rlen[0] = 0;
 	sl_bb_reset();
 	raw_spin_unlock_irqrestore(&sl_lock, flags);
 
-	while (kmsg_dump_get_line(&iter, false, line, sizeof(line), &len)) {
+	while (iter.cur_seq < iter.next_seq &&
+	       kmsg_dump_get_line(&iter, false, line, sizeof(line), &len)) {
 
 		if (sl_chunk_matches(line, len))
 			continue;
-		raw_spin_lock_irqsave(&sl_lock, flags);
+		if (!sl_log_lock(&flags))
+			return;
 		sl_feed_locked(line, len, true);
 		raw_spin_unlock_irqrestore(&sl_lock, flags);
 	}
@@ -2766,15 +2815,13 @@ static void sl_dump_kmsg_keep(void)
 	unsigned long flags;
 	size_t i;
 	unsigned int trace_lines = 0;
-	int n;
 
 	kmsg_dump_rewind(&iter);
 
-	raw_spin_lock_irqsave(&sl_lock, flags);
-	sl_feed_locked(mark, strlen(mark), true);
-	raw_spin_unlock_irqrestore(&sl_lock, flags);
+	sl_puts(mark, true);
 
-	while (kmsg_dump_get_line(&iter, false, line, sizeof(line), &len)) {
+	while (iter.cur_seq < iter.next_seq &&
+	       kmsg_dump_get_line(&iter, false, line, sizeof(line), &len)) {
 		bool keep = false;
 		bool in_trace = trace_lines > 0;
 
@@ -2796,15 +2843,13 @@ static void sl_dump_kmsg_keep(void)
 		if (!keep)
 			continue;
 
-		raw_spin_lock_irqsave(&sl_lock, flags);
+		if (!sl_log_lock(&flags))
+			return;
 		sl_feed_locked(line, len, true);
 		raw_spin_unlock_irqrestore(&sl_lock, flags);
 	}
 
-	n = scnprintf(line, sizeof(line), "### KEY LINES end ###\n");
-	raw_spin_lock_irqsave(&sl_lock, flags);
-	sl_feed_locked(line, n, true);
-	raw_spin_unlock_irqrestore(&sl_lock, flags);
+	sl_puts("### KEY LINES end ###\n", true);
 }
 
 static void sl_dump_fault_context(void)
@@ -2817,16 +2862,13 @@ static void sl_dump_fault_context(void)
 	bool found = false;
 
 	kmsg_dump_rewind(&iter);
-	while (kmsg_dump_get_line(&iter, false, line, sizeof(line), &len)) {
+	while (iter.cur_seq < iter.next_seq &&
+	       kmsg_dump_get_line(&iter, false, line, sizeof(line), &len)) {
 		if (!found && (strstr(line, "Internal error:") ||
 			       (strstr(line, "UBSAN:") &&
 				!strstr(line, "Kernel panic")))) {
 			found = true;
-			raw_spin_lock_irqsave(&sl_lock, flags);
-			sl_feed_locked("### FIRST FAULT CONTEXT ###\n",
-				       sizeof("### FIRST FAULT CONTEXT ###\n") - 1,
-				       true);
-			raw_spin_unlock_irqrestore(&sl_lock, flags);
+			sl_puts("### FIRST FAULT CONTEXT ###\n", true);
 		}
 		if (!found)
 			continue;
@@ -2837,7 +2879,8 @@ static void sl_dump_fault_context(void)
 		if (strstr(line, "NMI backtrace"))
 			break;
 
-		raw_spin_lock_irqsave(&sl_lock, flags);
+		if (!sl_log_lock(&flags))
+			return;
 		sl_feed_locked(line, len, true);
 		raw_spin_unlock_irqrestore(&sl_lock, flags);
 		if (strstr(line, "---[ end trace") || strstr(line, "Code:"))
@@ -2850,25 +2893,26 @@ static void sl_dump_fault_context(void)
 static int sl_panic_notify(struct notifier_block *nb, unsigned long ev, void *p)
 {
 	char buf[1024];
+	unsigned long flags;
 
 	if (!sl_enabled)
 		return NOTIFY_DONE;
 
-	sl_dead = true;
-	sl_fault_display();
+	WRITE_ONCE(sl_dead, true);
+	sl_canary_set_pending(true);
+	if (!raw_spin_trylock_irqsave(&sl_lock, flags))
+		return NOTIFY_DONE;
+	sl_fault_display_locked();
 	sl_bb_frozen = false;
 	sl_rp_drawn = false;
-	/* Panic may have stopped a CPU inside the timer callback. */
-	if (sl_timer_on)
-		timer_delete(&sl_timer);
+	sl_rp_full = false;
 	if (p)
 		sl_fault_why = p;
+	raw_spin_unlock_irqrestore(&sl_lock, flags);
 
 	scnprintf(buf, sizeof(buf), "### PANIC at stage %u\n", sl_stage);
 	sl_puts(buf, true);
 
-	/* Mark the crash before any dump that might itself stall. */
-	sl_canary_mark(true);
 	if (sl_bootdump >= 2)
 		sl_dump_kmsg();
 	if (sl_bootdump >= 1) {
@@ -2898,12 +2942,15 @@ static int sl_panic_notify(struct notifier_block *nb, unsigned long ev, void *p)
 
 	scnprintf(buf, sizeof(buf), "splashlog: PANIC why=%s\n",
 		      p ? (const char *)p : "?");
-	sl_puts(buf, true);
-	sl_render();
-	sl_border(SL_RED);
-
-	/* Keep post-notifier CPU stop and console replay noise out of the tail. */
+	if (!raw_spin_trylock_irqsave(&sl_lock, flags))
+		return NOTIFY_DONE;
+	sl_feed_locked(buf, strlen(buf), true);
 	sl_bb_frozen = true;
+	sl_canary_mark(true);
+	sl_canary_set_pending(false);
+	sl_render_locked(false);
+	sl_border_locked(SL_RED);
+	raw_spin_unlock_irqrestore(&sl_lock, flags);
 	return NOTIFY_DONE;
 }
 
