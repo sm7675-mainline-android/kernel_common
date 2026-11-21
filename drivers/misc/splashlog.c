@@ -1981,7 +1981,7 @@ static void sl_render(void)
 /* Timers are unavailable during the setup_arch() early console stage. */
 static void sl_kick(void)
 {
-	if (!sl_rtimer_ok || sl_rtimer_armed || sl_dead || sl_fb_frozen ||
+	if (!sl_ready || !sl_rtimer_ok || sl_rtimer_armed || sl_dead || sl_fb_frozen ||
 	    panic_in_progress() || READ_ONCE(oops_in_progress))
 		return;
 	sl_rtimer_armed = true;
