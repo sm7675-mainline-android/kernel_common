@@ -1697,13 +1697,15 @@ static void arm_smmu_iotlb_sync(struct iommu_domain *domain,
 
 	batch = smmu_domain->stage == ARM_SMMU_DOMAIN_S1 &&
 		smmu_domain->cfg.batch_leaf_tlbi && gather && gather->pgsize;
-	diag = batch && READ_ONCE(camera_tlb_diag);
+	diag = batch && !smmu_domain->cfg.flush_leaf_prefer_tlbiasid &&
+		READ_ONCE(camera_tlb_diag);
 	if (diag)
 		started = ktime_get_ns();
 
 	arm_smmu_rpm_get(smmu);
 	if (batch) {
-		full_asid = (gather->end - gather->start) / gather->pgsize >=
+		full_asid = smmu_domain->cfg.flush_leaf_prefer_tlbiasid ||
+			(gather->end - gather->start) / gather->pgsize >=
 			    ARM_SMMU_TLB_RANGE_MAX_PAGES;
 		if (full_asid) {
 			arm_smmu_tlb_inv_context_s1(smmu_domain);

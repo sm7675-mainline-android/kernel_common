@@ -414,13 +414,23 @@ static int qcom_smmu_init_context(struct arm_smmu_domain *smmu_domain,
 {
 	struct arm_smmu_device *smmu = smmu_domain->smmu;
 	struct qcom_smmu *qsmmu = to_qcom_smmu(smmu);
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
 	const struct of_device_id *client_match;
 	int cbndx = smmu_domain->cfg.cbndx;
 
 	smmu_domain->cfg.flush_walk_prefer_tlbiasid = true;
+	smmu_domain->cfg.flush_leaf_prefer_tlbiasid =
+		smmu_domain->stage == ARM_SMMU_DOMAIN_S1 &&
+		iommu_is_dma_domain(&smmu_domain->domain) &&
+		of_machine_is_compatible("qcom,cliffs") &&
+		of_device_is_compatible(dev->of_node, "qcom,geni-se-qup") &&
+		fwspec && fwspec->num_ids == 1 && fwspec->ids[0] == 0xa3;
 	smmu_domain->cfg.batch_leaf_tlbi =
+		smmu_domain->cfg.flush_leaf_prefer_tlbiasid ||
 		of_device_is_compatible(dev->of_node, "qcom,msm-cam-smmu-cb") ||
 		of_device_is_compatible(dev->of_node, "qcom,qsmmu-cam-cb");
+	if (smmu_domain->cfg.flush_leaf_prefer_tlbiasid)
+		dev_info(dev, "using ASID invalidation for QUP DMA mappings (SID 0xa3)\n");
 
 	client_match = qsmmu->data->client_match;
 
