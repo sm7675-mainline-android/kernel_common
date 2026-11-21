@@ -513,6 +513,7 @@ static const char sl_drop_default[] =
 	"EXT4-fs (dm-,mounted filesystem;"
 	"Reboot ending. Jumping to kernel;"
 	"OPL;leds;"
+	"gsi_stop_channel:,chan=1 busy try again;gsi_stop_channel:,chan=14 busy try again;"
 	"avc: denied;"
 	"arm-smmu;arm_smmu;"
 	"Adding to iommu group;wakeup function;";
