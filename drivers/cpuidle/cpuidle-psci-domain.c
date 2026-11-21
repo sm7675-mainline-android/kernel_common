@@ -29,6 +29,44 @@ struct psci_pd_provider {
 
 static LIST_HEAD(psci_pd_providers);
 
+#define CLIFFS_L3_OFF_STATE	0x41000044
+#define CLIFFS_CX_RET_STATE	0x41001344
+#define CLIFFS_LLCC_OFF_STATE	0x4100b344
+
+/*
+ * Cliffs can hang and reset after entering cx-ret or llcc-off during
+ * runtime idle, with no recorded PSCI return or CPU resume. Skip l3-off
+ * as a precaution to avoid the same cluster idle path while the reset
+ * source is unknown. Per-CPU idle and s2idle remain available.
+ */
+static void psci_pd_filter_cliffs_states(struct generic_pm_domain *pd)
+{
+	unsigned int index, kept = 0;
+
+	if (!of_machine_is_compatible("qcom,cliffs"))
+		return;
+
+	for (index = 0; index < pd->state_count; index++) {
+		struct genpd_power_state *state = &pd->states[index];
+		const u32 *parameter = state->data;
+
+		if (*parameter == CLIFFS_L3_OFF_STATE ||
+		    *parameter == CLIFFS_CX_RET_STATE ||
+		    *parameter == CLIFFS_LLCC_OFF_STATE) {
+			kfree(state->data);
+			continue;
+		}
+		if (kept != index)
+			pd->states[kept] = *state;
+		kept++;
+	}
+	if (!kept) {
+		kfree(pd->states);
+		pd->states = NULL;
+	}
+	pd->state_count = kept;
+}
+
 static int psci_pd_power_off(struct generic_pm_domain *pd)
 {
 	struct genpd_power_state *state = &pd->states[pd->state_idx];
@@ -54,6 +92,7 @@ static int psci_pd_init(struct device_node *np, bool use_osi)
 	pd = dt_idle_pd_alloc(np, psci_dt_parse_state_node);
 	if (!pd)
 		goto out;
+	psci_pd_filter_cliffs_states(pd);
 
 	pd_provider = kzalloc(sizeof(*pd_provider), GFP_KERNEL);
 	if (!pd_provider)
