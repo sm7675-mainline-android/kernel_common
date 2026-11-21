@@ -418,6 +418,12 @@ static int qcom_smmu_init_context(struct arm_smmu_domain *smmu_domain,
 	const struct of_device_id *client_match;
 	int cbndx = smmu_domain->cfg.cbndx;
 
+	smmu_domain->cfg.defer_s1_translation =
+		smmu_domain->stage == ARM_SMMU_DOMAIN_S1 &&
+		iommu_is_dma_domain(&smmu_domain->domain) &&
+		of_device_is_compatible(dev->of_node, "qcom,smmu_sde_unsec") &&
+		of_property_read_bool(dev->of_node, "qcom,iommu-earlymap");
+
 	smmu_domain->cfg.flush_walk_prefer_tlbiasid = true;
 	smmu_domain->cfg.flush_leaf_prefer_tlbiasid =
 		smmu_domain->stage == ARM_SMMU_DOMAIN_S1 &&

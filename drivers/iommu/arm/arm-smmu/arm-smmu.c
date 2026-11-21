@@ -607,6 +607,8 @@ static int arm_smmu_enable_s1_translation(struct iommu_domain *domain)
 	if (ret)
 		dev_err(smmu->dev, "failed to enable S1 translation cb=%u sctlr=%#x\n",
 			cfg->cbndx, sctlr);
+	else
+		cfg->defer_s1_translation = false;
 	arm_smmu_rpm_put(smmu);
 
 out_unlock:
@@ -846,7 +848,7 @@ static void arm_smmu_init_context_bank(struct arm_smmu_domain *smmu_domain,
 void arm_smmu_write_context_bank(struct arm_smmu_device *smmu, int idx)
 {
 	u32 reg;
-	bool stage1;
+	bool stage1, defer_s1;
 	struct arm_smmu_cb *cb = &smmu->cbs[idx];
 	struct arm_smmu_cfg *cfg = cb->cfg;
 
@@ -857,6 +859,15 @@ void arm_smmu_write_context_bank(struct arm_smmu_device *smmu, int idx)
 	}
 
 	stage1 = cfg->cbar != CBAR_TYPE_S2_TRANS;
+	defer_s1 = stage1 && cfg->defer_s1_translation;
+	if (defer_s1) {
+		reg = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_SCTLR);
+		if (reg & ARM_SMMU_SCTLR_M) {
+			arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_SCTLR,
+					  reg & ~ARM_SMMU_SCTLR_M);
+			arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_SCTLR);
+		}
+	}
 
 	/* CBA2R */
 	if (smmu->version > ARM_SMMU_V1) {
@@ -920,7 +931,9 @@ void arm_smmu_write_context_bank(struct arm_smmu_device *smmu, int idx)
 
 	/* SCTLR */
 	reg = ARM_SMMU_SCTLR_CFIE | ARM_SMMU_SCTLR_CFRE | ARM_SMMU_SCTLR_AFE |
-	      ARM_SMMU_SCTLR_TRE | ARM_SMMU_SCTLR_M;
+	      ARM_SMMU_SCTLR_TRE;
+	if (!defer_s1)
+		reg |= ARM_SMMU_SCTLR_M;
 	if (stage1)
 		reg |= ARM_SMMU_SCTLR_S1_ASIDPNE;
 	if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN))

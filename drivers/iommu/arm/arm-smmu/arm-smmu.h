@@ -382,6 +382,7 @@ struct arm_smmu_cfg {
 	bool				flush_walk_prefer_tlbiasid;
 	bool				flush_leaf_prefer_tlbiasid;
 	bool				batch_leaf_tlbi;
+	bool				defer_s1_translation;
 };
 #define ARM_SMMU_INVALID_IRPTNDX	0xff
 
