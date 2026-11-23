@@ -29,15 +29,13 @@ struct psci_pd_provider {
 
 static LIST_HEAD(psci_pd_providers);
 
-#define CLIFFS_L3_OFF_STATE	0x41000044
 #define CLIFFS_CX_RET_STATE	0x41001344
 #define CLIFFS_LLCC_OFF_STATE	0x4100b344
 
 /*
  * Cliffs can hang and reset after entering cx-ret or llcc-off during
- * runtime idle, with no recorded PSCI return or CPU resume. Skip l3-off
- * as a precaution to avoid the same cluster idle path while the reset
- * source is unknown. Per-CPU idle and s2idle remain available.
+ * runtime idle, with no recorded PSCI return or CPU resume. Filter these
+ * two states and retain l3-off in the APSS domain.
  */
 static void psci_pd_filter_cliffs_states(struct generic_pm_domain *pd)
 {
@@ -50,8 +48,7 @@ static void psci_pd_filter_cliffs_states(struct generic_pm_domain *pd)
 		struct genpd_power_state *state = &pd->states[index];
 		const u32 *parameter = state->data;
 
-		if (*parameter == CLIFFS_L3_OFF_STATE ||
-		    *parameter == CLIFFS_CX_RET_STATE ||
+		if (*parameter == CLIFFS_CX_RET_STATE ||
 		    *parameter == CLIFFS_LLCC_OFF_STATE) {
 			kfree(state->data);
 			continue;
