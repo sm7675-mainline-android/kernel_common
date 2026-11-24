@@ -1,0 +1,26 @@
+Zram-private LZ4 block codecs
+============================
+
+upstream/ contains unmodified lib/lz4.c, lib/lz4.h, lib/lz4hc.c and
+lib/lz4hc.h from https://github.com/lz4/lz4, tag v1.11.1, commit
+aa4647fad575d01a874aaaadcdbe8e6a40e072f5. Preserve their BSD license notices.
+
+Only the zram LZ4 and LZ4HC backends include these sources. Entry points
+have internal linkage, so they do not replace the kernel's public LZ4
+symbols or change filesystem and boot-decompressor workspaces or behavior.
+The freestanding headers and lz4_deps.h adapt ISO C dependencies and
+linkage without changing the imported files. Codec workspaces are
+allocated when a zram context is created, not during page compression.
+LZ4HC uses the extended workspace introduced in LZ4 v1.11.0, allowing
+levels 10 through 12 without allocating or using a large kernel stack.
+
+The integration follows the vendoring approach proposed by Michal
+Wilczynski for lib/lz4 (v2, November 6, 2026):
+https://lore.kernel.org/all/20261106-lz4-vendor-upstream-v2-0-ee04c3f0d7dc@samsung.com/
+The dictionary template optimization follows android-mainline commit
+f0f6f7871430 (zram: optimize LZ4 dictionary compression performance).
+Neither source is represented as a merged v1.11.1 lib/lz4 update.
+
+To update, copy the four release files verbatim, then check both backends
+with and without dictionaries, mixed page contents, legacy decoder
+compatibility, malformed blocks, and constrained output buffers.

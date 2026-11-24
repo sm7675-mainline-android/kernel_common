@@ -1,9 +1,10 @@
 #include <linux/kernel.h>
-#include <linux/lz4.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
 #include "backend_lz4.h"
+#include "lz4/lz4_deps.h"
+#include "lz4/upstream/lz4.c"
 
 struct lz4_ctx {
 	void *mem;
@@ -14,12 +15,34 @@ struct lz4_ctx {
 
 static void lz4_release_params(struct zcomp_params *params)
 {
+	kfree(params->drv_data);
+	params->drv_data = NULL;
 }
 
 static int lz4_setup_params(struct zcomp_params *params)
 {
+	LZ4_stream_t *dict_stream;
+	int ret;
+
 	if (params->level == ZCOMP_PARAM_NOT_SET)
 		params->level = LZ4_ACCELERATION_DEFAULT;
+	else if (params->level < LZ4_ACCELERATION_DEFAULT)
+		return -EINVAL;
+
+	if (!params->dict_sz)
+		return 0;
+	if (!params->dict || params->dict_sz > 65536)
+		return -EINVAL;
+
+	dict_stream = kzalloc(sizeof(*dict_stream), GFP_KERNEL);
+	if (!dict_stream)
+		return -ENOMEM;
+	ret = LZ4_loadDict(dict_stream, params->dict, params->dict_sz);
+	if (ret != params->dict_sz) {
+		kfree(dict_stream);
+		return -EINVAL;
+	}
+	params->drv_data = dict_stream;
 
 	return 0;
 }
@@ -35,6 +58,7 @@ static void lz4_destroy(struct zcomp_ctx *ctx)
 	kfree(zctx->dstrm);
 	kfree(zctx->cstrm);
 	kfree(zctx);
+	ctx->context = NULL;
 }
 
 static int lz4_create(struct zcomp_params *params, struct zcomp_ctx *ctx)
@@ -47,7 +71,7 @@ static int lz4_create(struct zcomp_params *params, struct zcomp_ctx *ctx)
 
 	ctx->context = zctx;
 	if (params->dict_sz == 0) {
-		zctx->mem = vmalloc(LZ4_MEM_COMPRESS);
+		zctx->mem = vmalloc(sizeof(LZ4_stream_t));
 		if (!zctx->mem)
 			goto error;
 	} else {
@@ -74,14 +98,11 @@ static int lz4_compress(struct zcomp_params *params, struct zcomp_ctx *ctx,
 	int ret;
 
 	if (!zctx->cstrm) {
-		ret = LZ4_compress_fast(req->src, req->dst, req->src_len,
-					req->dst_len, params->level,
-					zctx->mem);
+		ret = LZ4_compress_fast_extState(zctx->mem, req->src, req->dst,
+						 req->src_len, req->dst_len,
+						 params->level);
 	} else {
-		/* Cstrm needs to be reset */
-		ret = LZ4_loadDict(zctx->cstrm, params->dict, params->dict_sz);
-		if (ret != params->dict_sz)
-			return -EINVAL;
+		memcpy(zctx->cstrm, params->drv_data, sizeof(*zctx->cstrm));
 		ret = LZ4_compress_fast_continue(zctx->cstrm, req->src,
 						 req->dst, req->src_len,
 						 req->dst_len, params->level);
@@ -111,7 +132,7 @@ static int lz4_decompress(struct zcomp_params *params, struct zcomp_ctx *ctx,
 						   req->dst, req->src_len,
 						   req->dst_len);
 	}
-	if (ret < 0)
+	if (ret < 0 || ret != req->dst_len)
 		return -EINVAL;
 	return 0;
 }

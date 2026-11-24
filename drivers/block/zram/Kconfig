@@ -17,14 +17,14 @@ config ZRAM
 config ZRAM_BACKEND_LZ4
 	bool "lz4 compression support"
 	depends on ZRAM
-	select LZ4_COMPRESS
-	select LZ4_DECOMPRESS
+	help
+	  Use the zram-private upstream LZ4 v1.11.1 block codec.
 
 config ZRAM_BACKEND_LZ4HC
 	bool "lz4hc compression support"
 	depends on ZRAM
-	select LZ4HC_COMPRESS
-	select LZ4_DECOMPRESS
+	help
+	  Use the zram-private upstream LZ4HC v1.11.1 block codec.
 
 config ZRAM_BACKEND_ZSTD
 	bool "zstd compression support"

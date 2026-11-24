@@ -10,4 +10,7 @@ zram-$(CONFIG_ZRAM_BACKEND_DEFLATE)	+= backend_deflate.o
 zram-$(CONFIG_ZRAM_BACKEND_842)		+= backend_842.o
 zram-$(CONFIG_ZRAM_ANDROID_IOCTL)	+= zram_ioctl.o
 
+CFLAGS_backend_lz4.o += -I$(src)/lz4/freestanding
+CFLAGS_backend_lz4hc.o += -I$(src)/lz4/freestanding
+
 obj-$(CONFIG_ZRAM)	+=	zram.o
