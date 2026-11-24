@@ -16,6 +16,9 @@
 #include "backend_lzorle.h"
 #include "backend_lz4.h"
 #include "backend_lz4hc.h"
+#include "backend_lz4k.h"
+#include "backend_lz4kd.h"
+#include "backend_lz4k_oplus.h"
 #include "backend_zstd.h"
 #include "backend_deflate.h"
 #include "backend_842.h"
@@ -30,6 +33,15 @@ static const struct zcomp_ops *backends[] = {
 #endif
 #if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4HC)
 	&backend_lz4hc,
+#endif
+#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4K)
+	&backend_lz4k,
+#endif
+#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4KD)
+	&backend_lz4kd,
+#endif
+#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4K_OPLUS)
+	&backend_lz4k_oplus,
 #endif
 #if IS_ENABLED(CONFIG_ZRAM_BACKEND_ZSTD)
 	&backend_zstd,
