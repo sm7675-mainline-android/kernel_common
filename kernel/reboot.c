@@ -21,11 +21,6 @@
 
 #include <trace/hooks/reboot.h>
 
-#ifdef CONFIG_KSU_MANUAL_HOOK
-extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
-				 void __user **arg);
-#endif
-
 /*
  * this indicates whether you can reboot with ctrl-alt-del: the default is yes
  */
@@ -736,15 +731,9 @@ DEFINE_MUTEX(system_transition_mutex);
 SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 		void __user *, arg)
 {
-	struct pid_namespace *pid_ns;
+	struct pid_namespace *pid_ns = task_active_pid_ns(current);
 	char buffer[256];
-	int ret;
-
-#ifdef CONFIG_KSU_MANUAL_HOOK
-	(void)ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
-#endif
-	pid_ns = task_active_pid_ns(current);
-	ret = 0;
+	int ret = 0;
 
 	/* We only trust the superuser with rebooting the system. */
 	if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))
