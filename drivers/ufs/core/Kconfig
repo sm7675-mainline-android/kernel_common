@@ -42,6 +42,17 @@ config SCSI_UFS_FAULT_INJECTION
 	  Enable fault injection support in the UFS driver. This makes it easier
 	  to test the UFS error handler and abort handler.
 
+config SCSI_UFS_PANIC_ON_FATAL
+	bool "Panic on fatal UFS host errors"
+	depends on SCSI_UFSHCD
+	default n
+	help
+	  Stop UFS error recovery and panic after the request queue has been
+	  quiesced and fatal controller state has been logged. This is intended
+	  for devices where continuing after a fatal UFS error risks further
+	  filesystem damage. Ordinary command errors and recoverable link errors
+	  do not trigger this action.
+
 config SCSI_UFS_HWMON
 	bool "UFS Temperature Notification"
 	depends on SCSI_UFSHCD=HWMON || HWMON=y

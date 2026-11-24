@@ -571,7 +571,7 @@ static bool sl_chunk_matches(const char *s, unsigned int count)
 	memcpy(buf, s, n);
 	buf[n] = 0;
 
-	if (strnstr(buf, "GPU SMMU", n))
+	if (strnstr(buf, "GPU SMMU", n) || strnstr(buf, "UFS DMA ", n))
 		return false;
 	if (sl_pattern_match(sl_drop_default, buf, n))
 		return true;

@@ -621,6 +621,81 @@ static void ufshcd_print_evt_hist(struct ufs_hba *hba)
 	ufshcd_vops_dbg_register_dump(hba);
 }
 
+#ifdef CONFIG_SCSI_UFS_PANIC_ON_FATAL
+static void ufshcd_record_dma_map(struct ufs_hba *hba, struct ufshcd_lrb *lrbp,
+				  unsigned int mapped_nents)
+{
+	struct ufs_hba_priv *priv = to_hba_priv(hba);
+	struct ufshcd_dma_snapshot *snapshot;
+	struct scsi_cmnd *cmd = lrbp->cmd;
+	struct request *rq = scsi_cmd_to_rq(cmd);
+	struct scatterlist *sg;
+	unsigned long flags;
+	int index;
+
+	spin_lock_irqsave(&priv->diag_lock, flags);
+	snapshot = &priv->dma_snapshots[lrbp->task_tag];
+	snapshot->mapped_ns = ktime_get_mono_fast_ns();
+	snapshot->unmapped_ns = 0;
+	snapshot->lun = cmd->device->lun;
+	snapshot->sector = blk_rq_pos(rq);
+	snapshot->sectors = blk_rq_sectors(rq);
+	snapshot->bytes = scsi_bufflen(cmd);
+	snapshot->original_nents = scsi_sg_count(cmd);
+	snapshot->mapped_nents = mapped_nents;
+	snapshot->direction = cmd->sc_data_direction;
+	snapshot->cdb_len = min_t(unsigned int, cmd->cmd_len, sizeof(snapshot->cdb));
+	memcpy(snapshot->cdb, cmd->cmnd, snapshot->cdb_len);
+	for_each_sg(scsi_sglist(cmd), sg,
+		    min_t(unsigned int, mapped_nents, UFSHCD_DMA_DIAG_SEGMENTS), index) {
+		snapshot->segments[index].addr = sg_dma_address(sg);
+		snapshot->segments[index].len = sg_dma_len(sg);
+	}
+	spin_unlock_irqrestore(&priv->diag_lock, flags);
+}
+
+static void ufshcd_print_dma_snapshot(struct ufs_hba *hba, int tag, int prdt_length)
+{
+	struct ufs_hba_priv *priv = to_hba_priv(hba);
+	const struct ufshcd_lrb *lrbp = &hba->lrb[tag];
+	struct ufshcd_dma_snapshot snapshot;
+	unsigned long flags;
+	unsigned int count;
+	unsigned int index;
+
+	spin_lock_irqsave(&priv->diag_lock, flags);
+	snapshot = priv->dma_snapshots[tag];
+	spin_unlock_irqrestore(&priv->diag_lock, flags);
+	if (!snapshot.mapped_ns)
+		return;
+
+	dev_err(hba->dev,
+		"UPIU[%d] DMA snapshot: map_ns=%llu unmap_ns=%llu lun=%llu dir=%u bytes=%u sector=%llu sectors=%u cdb=%*phN\n",
+		tag, snapshot.mapped_ns, snapshot.unmapped_ns, snapshot.lun,
+		snapshot.direction, snapshot.bytes, (u64)snapshot.sector,
+		snapshot.sectors, snapshot.cdb_len, snapshot.cdb);
+	dev_err(hba->dev,
+		"UPIU[%d] original_sg=%u mapped_sg=%u live_prdt=%d captured_sg=%u\n",
+		tag, snapshot.original_nents, snapshot.mapped_nents, prdt_length,
+		min_t(unsigned int, snapshot.mapped_nents, UFSHCD_DMA_DIAG_SEGMENTS));
+	count = min_t(unsigned int, snapshot.mapped_nents, UFSHCD_DMA_DIAG_SEGMENTS);
+	count = min_t(unsigned int, count, prdt_length);
+	for (index = 0; index < count; index++) {
+		struct ufshcd_sg_entry *prd = (void *)lrbp->ucd_prdt_ptr +
+			index * ufshcd_sg_entry_size(hba);
+		dma_addr_t prd_addr = le64_to_cpu(prd->addr);
+		u64 prd_len = (u64)le32_to_cpu(prd->size) + 1;
+
+		dev_err(hba->dev,
+			"UPIU[%d] SG[%u]: mapped_dma=%pad len=%u PRDT dma=%pad len=%llu %s\n",
+			tag, index, &snapshot.segments[index].addr,
+			snapshot.segments[index].len, &prd_addr, prd_len,
+			snapshot.segments[index].addr == prd_addr &&
+			snapshot.segments[index].len == prd_len ? "match" : "MISMATCH");
+	}
+}
+#endif
+
 static
 void ufshcd_print_tr(struct ufs_hba *hba, int tag, bool pr_prdt)
 {
@@ -654,6 +729,16 @@ void ufshcd_print_tr(struct ufs_hba *hba, int tag, bool pr_prdt)
 		lrbp->utr_descriptor_ptr->prd_table_length);
 	if (hba->quirks & UFSHCD_QUIRK_PRDT_BYTE_GRAN)
 		prdt_length /= ufshcd_sg_entry_size(hba);
+	if (prdt_length > SG_ALL) {
+		dev_err(hba->dev, "UPIU[%d] invalid PRDT length=%d limit=%u\n",
+			tag, prdt_length, SG_ALL);
+		prdt_length = SG_ALL;
+	}
+
+#ifdef CONFIG_SCSI_UFS_PANIC_ON_FATAL
+	if (pr_prdt && (hba->saved_err & SYSTEM_BUS_FATAL_ERROR))
+		ufshcd_print_dma_snapshot(hba, tag, prdt_length);
+#endif
 
 	dev_err(hba->dev,
 		"UPIU[%d] - PRDT - %d entries  phys@0x%llx\n",
@@ -2850,7 +2935,12 @@ static int ufshcd_map_sg(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
 	trace_android_vh_ufs_fill_prdt(hba, lrbp, sg_segments, &err);
 	if (err)
 		return err;
-	return ufshcd_crypto_fill_prdt(hba, lrbp);
+	err = ufshcd_crypto_fill_prdt(hba, lrbp);
+#ifdef CONFIG_SCSI_UFS_PANIC_ON_FATAL
+	if (!err)
+		ufshcd_record_dma_map(hba, lrbp, sg_segments);
+#endif
+	return err;
 }
 
 /**
@@ -4252,6 +4342,12 @@ skip_utmrdl:
 		dev_err(hba->dev, "LRB Memory allocation failed\n");
 		goto out;
 	}
+#ifdef CONFIG_SCSI_UFS_PANIC_ON_FATAL
+	to_hba_priv(hba)->dma_snapshots = devm_kcalloc(hba->dev, hba->nutrs,
+			sizeof(struct ufshcd_dma_snapshot), GFP_KERNEL);
+	if (!to_hba_priv(hba)->dma_snapshots)
+		goto out;
+#endif
 	return 0;
 out:
 	return -ENOMEM;
@@ -6201,6 +6297,16 @@ void ufshcd_release_scsi_cmd(struct ufs_hba *hba,
 	struct scsi_cmnd *cmd = lrbp->cmd;
 
 	scsi_dma_unmap(cmd);
+#ifdef CONFIG_SCSI_UFS_PANIC_ON_FATAL
+	{
+		struct ufs_hba_priv *priv = to_hba_priv(hba);
+		unsigned long flags;
+
+		spin_lock_irqsave(&priv->diag_lock, flags);
+		priv->dma_snapshots[lrbp->task_tag].unmapped_ns = ktime_get_mono_fast_ns();
+		spin_unlock_irqrestore(&priv->diag_lock, flags);
+	}
+#endif
 	ufshcd_crypto_clear_prdt(hba, lrbp);
 	ufshcd_release(hba);
 	ufshcd_clk_scaling_update_busy(hba);
@@ -7363,11 +7469,27 @@ again:
 		ufshcd_print_host_state(hba);
 		ufshcd_print_pwr_info(hba);
 		ufshcd_print_tx_eq_params(hba);
+		if (pr_prdt)
+			ufshcd_print_trs_all(hba, true);
 		ufshcd_print_evt_hist(hba);
 		ufshcd_print_tmrs(hba, hba->outstanding_tasks);
-		ufshcd_print_trs_all(hba, pr_prdt);
+		if (!pr_prdt)
+			ufshcd_print_trs_all(hba, false);
 		spin_lock_irqsave(hba->host->host_lock, flags);
 	}
+
+#ifdef CONFIG_SCSI_UFS_PANIC_ON_FATAL
+	if (ufshcd_is_saved_err_fatal(hba)) {
+		u32 saved_err = hba->saved_err;
+		u32 saved_uic_err = hba->saved_uic_err;
+
+		spin_unlock_irqrestore(hba->host->host_lock, flags);
+		dev_emerg(hba->dev,
+			  "fatal UFS error; stopping recovery: saved_err=0x%x saved_uic_err=0x%x\n",
+			  saved_err, saved_uic_err);
+		panic("UFS fatal error on %s", dev_name(hba->dev));
+	}
+#endif
 
 	/*
 	 * if host reset is required then skip clearing the pending
@@ -9524,6 +9646,10 @@ static void ufshcd_release_sdb_queue(struct ufs_hba *hba, int nutrs)
 			   hba->utrdl_dma_addr);
 
 	devm_kfree(hba->dev, hba->lrb);
+#ifdef CONFIG_SCSI_UFS_PANIC_ON_FATAL
+	devm_kfree(hba->dev, to_hba_priv(hba)->dma_snapshots);
+	to_hba_priv(hba)->dma_snapshots = NULL;
+#endif
 }
 
 static int ufshcd_alloc_mcq(struct ufs_hba *hba)

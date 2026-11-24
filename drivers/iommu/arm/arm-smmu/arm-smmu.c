@@ -734,6 +734,30 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 
 	if (!(cfi.fsr & ARM_SMMU_CB_FSR_FAULT))
 		return IRQ_NONE;
+	if (IS_ENABLED(CONFIG_SCSI_UFS_PANIC_ON_FATAL) &&
+	    of_machine_is_compatible("qcom,cliffs") &&
+	    cfi.cbfrsynra == 0x60 && smmu_domain->pgtbl_ops) {
+		phys_addr_t phys = smmu_domain->pgtbl_ops->iova_to_phys(
+			smmu_domain->pgtbl_ops, cfi.iova);
+
+		dev_err(smmu->dev,
+			"UFS DMA fault snapshot: sid=%#x cb=%d iova=%#lx sw_phys=%pa dir=%s fsr=%#x fsynr=%#x domain=%u stage=%u asid=%u vmid=%u\n",
+			cfi.cbfrsynra, idx, cfi.iova, &phys,
+			cfi.fsynr & ARM_SMMU_CB_FSYNR0_WNR ? "write" : "read",
+			cfi.fsr, cfi.fsynr, smmu_domain->domain.type,
+			smmu_domain->stage, smmu_domain->cfg.asid,
+			smmu_domain->cfg.vmid);
+		dev_err(smmu->dev,
+			"UFS DMA context: sctlr=%#x ttbr0=%#llx ttbr1=%#llx tcr=%#x tcr2=%#x asid_leaf=%u batch_leaf=%u asid_walk=%u\n",
+			arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_SCTLR),
+			arm_smmu_cb_readq(smmu, idx, ARM_SMMU_CB_TTBR0),
+			arm_smmu_cb_readq(smmu, idx, ARM_SMMU_CB_TTBR1),
+			arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_TCR),
+			arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_TCR2),
+			smmu_domain->cfg.flush_leaf_prefer_tlbiasid,
+			smmu_domain->cfg.batch_leaf_tlbi,
+			smmu_domain->cfg.flush_walk_prefer_tlbiasid);
+	}
 	if ((cfi.cbfrsynra & 0xff00) == 0x1000 && __ratelimit(&dsp_rs))
 		pr_err("DSP IOMMU fault cb=%d sid=%#x iova=%#lx fsr=%#x fsynr=%#x domain=%u\n",
 		       idx, cfi.cbfrsynra, cfi.iova, cfi.fsr, cfi.fsynr,

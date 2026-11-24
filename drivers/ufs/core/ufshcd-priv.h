@@ -6,8 +6,33 @@
 #include <linux/pm_runtime.h>
 #include <ufs/ufshcd.h>
 
+#ifdef CONFIG_SCSI_UFS_PANIC_ON_FATAL
+#define UFSHCD_DMA_DIAG_SEGMENTS 16
+
+struct ufshcd_dma_snapshot {
+	u64 mapped_ns;
+	u64 unmapped_ns;
+	u64 lun;
+	sector_t sector;
+	u32 sectors;
+	u32 bytes;
+	u32 original_nents;
+	u32 mapped_nents;
+	u8 direction;
+	u8 cdb_len;
+	u8 cdb[32];
+	struct {
+		dma_addr_t addr;
+		u32 len;
+	} segments[UFSHCD_DMA_DIAG_SEGMENTS];
+};
+#endif
+
 struct ufs_hba_priv {
 	struct ufs_hba hba;
+#ifdef CONFIG_SCSI_UFS_PANIC_ON_FATAL
+	struct ufshcd_dma_snapshot *dma_snapshots;
+#endif
 	spinlock_t diag_lock;
 	struct delayed_work diag_work;
 	DECLARE_BITMAP(diag_pending, 256);
